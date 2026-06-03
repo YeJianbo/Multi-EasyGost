@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.2"
+shell_version="1.1.3"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -67,12 +67,34 @@ validate_filename_token() {
   [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
 }
 
+normalize_input() {
+  local input="$1"
+  local output=""
+  local char=""
+  while IFS= read -r -n1 char; do
+    case "$char" in
+    $'\b' | $'\x7f')
+      output="${output%?}"
+      ;;
+    $'\r' | $'\n')
+      ;;
+    [[:cntrl:]])
+      ;;
+    *)
+      output+="$char"
+      ;;
+    esac
+  done <<<"$input"
+  printf '%s' "$output"
+}
+
 ask_yes_no() {
   local prompt="$1"
   local default_value="$2"
   local answer
   while true; do
     read -r -p "$prompt" answer
+    answer=$(normalize_input "$answer")
     [[ -z "${answer}" ]] && answer="${default_value}"
     case "${answer}" in
     [Yy] | [Yy][Ee][Ss])
@@ -94,6 +116,7 @@ prompt_choice() {
   local answer
   while true; do
     read -r -p "$prompt" answer
+    answer=$(normalize_input "$answer")
     for option in "$@"; do
       if [[ "${answer}" == "${option}" ]]; then
         REPLY="${answer}"
@@ -111,6 +134,7 @@ prompt_nonempty() {
   local answer
   while true; do
     read -r -p "$prompt" answer
+    answer=$(normalize_input "$answer")
     if [[ -n "${answer}" ]] && { [[ -z "${validator}" ]] || "${validator}" "${answer}"; }; then
       REPLY="${answer}"
       return 0
@@ -128,6 +152,57 @@ download_file() {
     curl -LkfsS "${url}" -o "${output}"
   else
     return 1
+  fi
+}
+
+probe_url() {
+  local url="$1"
+  local duration=""
+  local start_ts=""
+  local end_ts=""
+  if command -v curl >/dev/null 2>&1; then
+    duration=$(curl -Lk -o /dev/null -s -w '%{time_total}' --connect-timeout 5 --max-time 8 "${url}" 2>/dev/null)
+    if [[ -n "${duration}" && "${duration}" != "0.000000" ]]; then
+      printf '%s\n' "${duration}"
+      return 0
+    fi
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    start_ts=$(date +%s%3N 2>/dev/null)
+    if wget --no-check-certificate -q --spider -T 8 "${url}" 2>/dev/null; then
+      end_ts=$(date +%s%3N 2>/dev/null)
+      if [[ -n "${start_ts}" && -n "${end_ts}" ]]; then
+        awk -v start="${start_ts}" -v end="${end_ts}" 'BEGIN { printf "%.3f\n", (end-start)/1000 }'
+        return 0
+      fi
+      printf '1.000\n'
+      return 0
+    fi
+  fi
+  return 1
+}
+
+choose_download_source() {
+  local global_probe_url="https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.service"
+  local cn_probe_url="https://gotunnel.oss-cn-shenzhen.aliyuncs.com/gost.service"
+  local global_time=""
+  local cn_time=""
+
+  global_time=$(probe_url "${global_probe_url}") || global_time=""
+  cn_time=$(probe_url "${cn_probe_url}") || cn_time=""
+
+  if [[ -n "${global_time}" && -n "${cn_time}" ]]; then
+    if awk -v global="${global_time}" -v cn="${cn_time}" 'BEGIN { exit !(cn < global) }'; then
+      REPLY="cn"
+    else
+      REPLY="global"
+    fi
+  elif [[ -n "${global_time}" ]]; then
+    REPLY="global"
+  elif [[ -n "${cn_time}" ]]; then
+    REPLY="cn"
+  else
+    REPLY="global"
   fi
 }
 
@@ -231,7 +306,7 @@ function check_nor_file() {
   cleanup_temp
 }
 function Install_ct() {
-  local use_cn_mirror="n"
+  local source_mode=""
   local binary_url=""
   local service_url=""
   local config_url=""
@@ -248,9 +323,12 @@ function Install_ct() {
     echo -e "${Info} 检测到已安装 gost，本次将覆盖二进制和服务文件，并保留现有配置。"
   fi
 
-  echo -e "默认使用海外源下载；仅当机器访问 GitHub 较慢时再切换到大陆镜像。"
-  if ask_yes_no "是否切换到大陆镜像？[y/N]:" "n"; then
-    use_cn_mirror="y"
+  choose_download_source
+  source_mode="${REPLY}"
+  if [[ "${source_mode}" == "cn" ]]; then
+    echo -e "${Info} 已自动选择大陆镜像下载。"
+  else
+    echo -e "${Info} 已自动选择海外源下载。"
   fi
 
   install_tmp_dir=$(mktemp -d /tmp/gost-install.XXXXXX) || {
@@ -261,7 +339,7 @@ function Install_ct() {
   binary_gz="${install_tmp_dir}/gost-linux-${bit}-${ct_new_ver}.gz"
   binary_plain="${install_tmp_dir}/gost-linux-${bit}-${ct_new_ver}"
 
-  if [[ "${use_cn_mirror}" == "y" ]]; then
+  if [[ "${source_mode}" == "cn" ]]; then
     binary_url="https://gotunnel.oss-cn-shenzhen.aliyuncs.com/gost-linux-${bit}-${ct_new_ver}.gz"
     service_url="https://gotunnel.oss-cn-shenzhen.aliyuncs.com/gost.service"
     config_url="https://gotunnel.oss-cn-shenzhen.aliyuncs.com/config.json"
