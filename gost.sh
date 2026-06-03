@@ -2,24 +2,166 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.1"
+shell_version="1.1.2"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
-function checknew() {
-  checknew=$(gost -V 2>&1 | awk '{print $2}')
-  # check_new_ver
-  echo "你的gost版本为:""$checknew"""
-  echo -n 是否更新\(y/n\)\:
-  read checknewnum
-  if test $checknewnum = "y"; then
-    cp -r /etc/gost /tmp/
-    Install_ct
-    rm -rf /etc/gost
-    mv /tmp/gost /etc/
-    systemctl restart gost
+install_tmp_dir=""
+peer_tmp_file=""
+
+cleanup_temp() {
+  if [[ -n "${install_tmp_dir}" && -d "${install_tmp_dir}" ]]; then
+    rm -rf "${install_tmp_dir}"
+    install_tmp_dir=""
+  fi
+  if [[ -n "${peer_tmp_file}" && -f "${peer_tmp_file}" ]]; then
+    rm -f "${peer_tmp_file}"
+    peer_tmp_file=""
+  fi
+}
+
+handle_interrupt() {
+  echo
+  echo -e "${Error} 操作已取消，临时文件已清理。"
+  cleanup_temp
+  exit 130
+}
+
+trap cleanup_temp EXIT
+trap handle_interrupt INT TERM
+
+is_gost_installed() {
+  command -v gost >/dev/null 2>&1 || [[ -f /usr/bin/gost || -f /usr/lib/systemd/system/gost.service || -d /etc/gost ]]
+}
+
+ensure_gost_dir() {
+  mkdir -p /etc/gost
+}
+
+ensure_raw_conf_file() {
+  ensure_gost_dir
+  touch "$raw_conf_path"
+}
+
+validate_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535))
+}
+
+validate_menu_number() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+validate_no_space_or_delimiter() {
+  [[ -n "$1" && "$1" != *"#"* && "$1" != *[[:space:]]* ]]
+}
+
+validate_host() {
+  [[ "$1" =~ ^[A-Za-z0-9._:-]+$ ]]
+}
+
+validate_host_header() {
+  [[ "$1" =~ ^[A-Za-z0-9.-]+$ ]]
+}
+
+validate_filename_token() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+ask_yes_no() {
+  local prompt="$1"
+  local default_value="$2"
+  local answer
+  while true; do
+    read -r -p "$prompt" answer
+    [[ -z "${answer}" ]] && answer="${default_value}"
+    case "${answer}" in
+    [Yy] | [Yy][Ee][Ss])
+      return 0
+      ;;
+    [Nn] | [Nn][Oo])
+      return 1
+      ;;
+    *)
+      echo "请输入 y 或 n"
+      ;;
+    esac
+  done
+}
+
+prompt_choice() {
+  local prompt="$1"
+  shift
+  local answer
+  while true; do
+    read -r -p "$prompt" answer
+    for option in "$@"; do
+      if [[ "${answer}" == "${option}" ]]; then
+        REPLY="${answer}"
+        return 0
+      fi
+    done
+    echo "请输入正确选项: $*"
+  done
+}
+
+prompt_nonempty() {
+  local prompt="$1"
+  local validator="$2"
+  local error_message="$3"
+  local answer
+  while true; do
+    read -r -p "$prompt" answer
+    if [[ -n "${answer}" ]] && { [[ -z "${validator}" ]] || "${validator}" "${answer}"; }; then
+      REPLY="${answer}"
+      return 0
+    fi
+    echo "${error_message}"
+  done
+}
+
+download_file() {
+  local url="$1"
+  local output="$2"
+  if command -v wget >/dev/null 2>&1; then
+    wget --no-check-certificate -q -O "${output}" "${url}"
+  elif command -v curl >/dev/null 2>&1; then
+    curl -LkfsS "${url}" -o "${output}"
   else
-    exit 0
+    return 1
+  fi
+}
+
+rebuild_config() {
+  ensure_raw_conf_file
+  rm -f "$gost_conf_path"
+  confstart
+  writeconf
+  conflast
+}
+
+apply_runtime_config() {
+  check_root
+  if ! is_gost_installed; then
+    echo -e "${Error} gost 尚未安装，请先安装。"
+    return 1
+  fi
+  rebuild_config
+  if systemctl restart gost; then
+    return 0
+  fi
+  echo -e "${Error} gost 重启失败，请检查配置内容。"
+  return 1
+}
+
+function checknew() {
+  if ! is_gost_installed; then
+    echo -e "${Error} gost 尚未安装，无需更新。"
+    return 1
+  fi
+  checknew=$(gost -V 2>&1 | awk '{print $2}')
+  echo "你的gost版本为:${checknew:-未知}"
+  if ask_yes_no "是否更新？[y/N]:" "n"; then
+    Install_ct
   fi
 }
 function check_sys() {
@@ -39,22 +181,30 @@ function check_sys() {
     release="centos"
   fi
   bit=$(uname -m)
-  if test "$bit" != "x86_64"; then
-    echo "请输入你的芯片架构，/386/armv5/armv6/armv7/armv8"
-    read bit
-  else
+  case "$bit" in
+  x86_64)
     bit="amd64"
-  fi
+    ;;
+  aarch64 | arm64)
+    bit="arm64"
+    ;;
+  i386 | i686)
+    bit="386"
+    ;;
+  *)
+    prompt_choice "请输入你的芯片架构 [386/armv5/armv6/armv7/arm64/amd64]:" 386 armv5 armv6 armv7 arm64 amd64
+    bit="$REPLY"
+    ;;
+  esac
 }
 function Installation_dependency() {
-  gzip_ver=$(gzip -V)
-  if [[ -z ${gzip_ver} ]]; then
+  if ! command -v gzip >/dev/null 2>&1 || ! command -v gunzip >/dev/null 2>&1 || { ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; }; then
     if [[ ${release} == "centos" ]]; then
       yum update
-      yum install -y gzip wget
+      yum install -y gzip wget curl ca-certificates
     else
       apt-get update
-      apt-get install -y gzip wget
+      apt-get install -y gzip wget curl ca-certificates
     fi
   fi
 }
@@ -74,84 +224,130 @@ function check_new_ver() {
 function check_file() {
   if test ! -d "/usr/lib/systemd/system/"; then
     mkdir /usr/lib/systemd/system
-    chmod -R 777 /usr/lib/systemd/system
+    chmod 755 /usr/lib/systemd/system
   fi
 }
 function check_nor_file() {
-  rm -rf "$(pwd)"/gost
-  rm -rf "$(pwd)"/gost.service
-  rm -rf "$(pwd)"/config.json
-  rm -rf /etc/gost
-  rm -rf /usr/lib/systemd/system/gost.service
-  rm -rf /usr/bin/gost
+  cleanup_temp
 }
 function Install_ct() {
+  local use_cn_mirror="n"
+  local binary_url=""
+  local service_url=""
+  local config_url=""
+  local binary_gz=""
+  local binary_plain=""
+
   check_root
   check_nor_file
+  check_sys
   Installation_dependency
   check_file
-  check_sys
-  # check_new_ver
-  echo -e "若为国内机器建议使用大陆镜像加速下载"
-  read -e -p "是否使用？[y/n]:" addyn
-  [[ -z ${addyn} ]] && addyn="n"
-  if [[ ${addyn} == [Yy] ]]; then
-    rm -rf gost-linux-"$bit"-"$ct_new_ver".gz
-    wget --no-check-certificate https://gotunnel.oss-cn-shenzhen.aliyuncs.com/gost-linux-"$bit"-"$ct_new_ver".gz
-    gunzip gost-linux-"$bit"-"$ct_new_ver".gz
-    mv gost-linux-"$bit"-"$ct_new_ver" gost
-    mv gost /usr/bin/gost
-    chmod -R 777 /usr/bin/gost
-    wget --no-check-certificate https://gotunnel.oss-cn-shenzhen.aliyuncs.com/gost.service && chmod -R 777 gost.service && mv gost.service /usr/lib/systemd/system
-    mkdir /etc/gost && wget --no-check-certificate https://gotunnel.oss-cn-shenzhen.aliyuncs.com/config.json && mv config.json /etc/gost && chmod -R 777 /etc/gost
-  else
-    rm -rf gost-linux-"$bit"-"$ct_new_ver".gz
-    wget --no-check-certificate https://github.com/ginuerzh/gost/releases/download/v"$ct_new_ver"/gost-linux-"$bit"-"$ct_new_ver".gz
-    gunzip gost-linux-"$bit"-"$ct_new_ver".gz
-    mv gost-linux-"$bit"-"$ct_new_ver" gost
-    mv gost /usr/bin/gost
-    chmod -R 777 /usr/bin/gost
-    wget --no-check-certificate https://raw.githubusercontent.com/KANIKIG/Multi-EasyGost/master/gost.service && chmod -R 777 gost.service && mv gost.service /usr/lib/systemd/system
-    mkdir /etc/gost && wget --no-check-certificate https://raw.githubusercontent.com/KANIKIG/Multi-EasyGost/master/config.json && mv config.json /etc/gost && chmod -R 777 /etc/gost
+
+  if is_gost_installed; then
+    echo -e "${Info} 检测到已安装 gost，本次将覆盖二进制和服务文件，并保留现有配置。"
   fi
 
-  systemctl enable gost && systemctl restart gost
+  echo -e "默认使用海外源下载；仅当机器访问 GitHub 较慢时再切换到大陆镜像。"
+  if ask_yes_no "是否切换到大陆镜像？[y/N]:" "n"; then
+    use_cn_mirror="y"
+  fi
+
+  install_tmp_dir=$(mktemp -d /tmp/gost-install.XXXXXX) || {
+    echo -e "${Error} 无法创建临时目录。"
+    return 1
+  }
+
+  binary_gz="${install_tmp_dir}/gost-linux-${bit}-${ct_new_ver}.gz"
+  binary_plain="${install_tmp_dir}/gost-linux-${bit}-${ct_new_ver}"
+
+  if [[ "${use_cn_mirror}" == "y" ]]; then
+    binary_url="https://gotunnel.oss-cn-shenzhen.aliyuncs.com/gost-linux-${bit}-${ct_new_ver}.gz"
+    service_url="https://gotunnel.oss-cn-shenzhen.aliyuncs.com/gost.service"
+    config_url="https://gotunnel.oss-cn-shenzhen.aliyuncs.com/config.json"
+  else
+    binary_url="https://github.com/ginuerzh/gost/releases/download/v${ct_new_ver}/gost-linux-${bit}-${ct_new_ver}.gz"
+    service_url="https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.service"
+    config_url="https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/config.json"
+  fi
+
+  if ! download_file "${binary_url}" "${binary_gz}"; then
+    echo -e "${Error} gost 二进制下载失败。"
+    return 1
+  fi
+  if ! gunzip -f "${binary_gz}"; then
+    echo -e "${Error} gost 二进制解压失败。"
+    return 1
+  fi
+  if ! download_file "${service_url}" "${install_tmp_dir}/gost.service"; then
+    echo -e "${Error} gost.service 下载失败。"
+    return 1
+  fi
+
+  ensure_gost_dir
+  if [[ ! -f "$gost_conf_path" ]]; then
+    if ! download_file "${config_url}" "${install_tmp_dir}/config.json"; then
+      echo -e "${Error} 默认配置下载失败。"
+      return 1
+    fi
+    install -m 644 "${install_tmp_dir}/config.json" "$gost_conf_path"
+  fi
+
+  install -m 755 "${binary_plain}" /usr/bin/gost
+  install -m 644 "${install_tmp_dir}/gost.service" /usr/lib/systemd/system/gost.service
+  ensure_raw_conf_file
+
+  systemctl daemon-reload
+  systemctl enable gost >/dev/null 2>&1
+  if ! systemctl restart gost; then
+    echo -e "${Error} gost 安装完成，但服务启动失败，请检查现有配置。"
+    return 1
+  fi
+
   echo "------------------------------"
-  if test -a /usr/bin/gost -a /usr/lib/systemctl/gost.service -a /etc/gost/config.json; then
+  if test -a /usr/bin/gost -a /usr/lib/systemd/system/gost.service -a /etc/gost/config.json; then
     echo "gost安装成功"
-    rm -rf "$(pwd)"/gost
-    rm -rf "$(pwd)"/gost.service
-    rm -rf "$(pwd)"/config.json
   else
     echo "gost没有安装成功"
-    rm -rf "$(pwd)"/gost
-    rm -rf "$(pwd)"/gost.service
-    rm -rf "$(pwd)"/config.json
-    rm -rf "$(pwd)"/gost.sh
+    return 1
   fi
 }
 function Uninstall_ct() {
+  check_root
+  if ! is_gost_installed; then
+    echo -e "${Info} gost 当前未安装。"
+    return 0
+  fi
+  systemctl stop gost >/dev/null 2>&1
+  systemctl disable gost >/dev/null 2>&1
   rm -rf /usr/bin/gost
   rm -rf /usr/lib/systemd/system/gost.service
   rm -rf /etc/gost
-  rm -rf "$(pwd)"/gost.sh
+  systemctl daemon-reload
   echo "gost已经成功删除"
 }
 function Start_ct() {
+  check_root
+  if ! is_gost_installed; then
+    echo -e "${Error} gost 尚未安装。"
+    return 1
+  fi
   systemctl start gost
   echo "已启动"
 }
 function Stop_ct() {
+  check_root
+  if ! is_gost_installed; then
+    echo -e "${Error} gost 尚未安装。"
+    return 1
+  fi
   systemctl stop gost
   echo "已停止"
 }
 function Restart_ct() {
-  rm -rf /etc/gost/config.json
-  confstart
-  writeconf
-  conflast
-  systemctl restart gost
-  echo "已重读配置并重启"
+  if apply_runtime_config; then
+    echo "已重读配置并重启"
+  fi
 }
 function read_protocol() {
   echo -e "请问您要设置哪种功能: "
@@ -176,39 +372,36 @@ function read_protocol() {
   echo -e "[6] 进阶：转发CDN自选节点"
   echo -e "说明: 只需在中转机设置"
   echo -e "-----------------------------------"
-  read -p "请选择: " numprotocol
+  prompt_choice "请选择: " 1 2 3 4 5 6
+  numprotocol="$REPLY"
 
-  if [ "$numprotocol" == "1" ]; then
-    flag_a="nonencrypt"
-  elif [ "$numprotocol" == "2" ]; then
-    encrypt
-  elif [ "$numprotocol" == "3" ]; then
-    decrypt
-  elif [ "$numprotocol" == "4" ]; then
-    proxy
-  elif [ "$numprotocol" == "5" ]; then
-    enpeer
-  elif [ "$numprotocol" == "6" ]; then
-    cdn
-  else
-    echo "type error, please try again"
-    exit
-  fi
+  case "$numprotocol" in
+  1) flag_a="nonencrypt" ;;
+  2) encrypt ;;
+  3) decrypt ;;
+  4) proxy ;;
+  5) enpeer ;;
+  6) cdn ;;
+  esac
 }
 function read_s_port() {
   if [ "$flag_a" == "ss" ]; then
     echo -e "-----------------------------------"
-    read -p "请输入ss密码: " flag_b
+    prompt_nonempty "请输入ss密码: " validate_no_space_or_delimiter "密码不能为空，且不能包含空格或 #"
+    flag_b="$REPLY"
   elif [ "$flag_a" == "socks" ]; then
     echo -e "-----------------------------------"
-    read -p "请输入socks密码: " flag_b
+    prompt_nonempty "请输入socks密码: " validate_no_space_or_delimiter "密码不能为空，且不能包含空格或 #"
+    flag_b="$REPLY"
   elif [ "$flag_a" == "http" ]; then
     echo -e "-----------------------------------"
-    read -p "请输入http密码: " flag_b
+    prompt_nonempty "请输入http密码: " validate_no_space_or_delimiter "密码不能为空，且不能包含空格或 #"
+    flag_b="$REPLY"
   else
     echo -e "------------------------------------------------------------------"
     echo -e "请问你要将本机哪个端口接收到的流量进行转发?"
-    read -p "请输入: " flag_b
+    prompt_nonempty "请输入: " validate_port "请输入合法端口（1-65535）"
+    flag_b="$REPLY"
   fi
 }
 function read_d_ip() {
@@ -223,49 +416,54 @@ function read_d_ip() {
     echo -e "[5] rc4-md5"
     echo -e "[6] AEAD_CHACHA20_POLY1305"
     echo -e "-----------------------------------"
-    read -p "请选择ss加密方式: " ssencrypt
+    prompt_choice "请选择ss加密方式: " 1 2 3 4 5 6
+    ssencrypt="$REPLY"
 
-    if [ "$ssencrypt" == "1" ]; then
-      flag_c="aes-256-gcm"
-    elif [ "$ssencrypt" == "2" ]; then
-      flag_c="aes-256-cfb"
-    elif [ "$ssencrypt" == "3" ]; then
-      flag_c="chacha20-ietf-poly1305"
-    elif [ "$ssencrypt" == "4" ]; then
-      flag_c="chacha20"
-    elif [ "$ssencrypt" == "5" ]; then
-      flag_c="rc4-md5"
-    elif [ "$ssencrypt" == "6" ]; then
-      flag_c="AEAD_CHACHA20_POLY1305"
-    else
-      echo "type error, please try again"
-      exit
-    fi
+    case "$ssencrypt" in
+    1) flag_c="aes-256-gcm" ;;
+    2) flag_c="aes-256-cfb" ;;
+    3) flag_c="chacha20-ietf-poly1305" ;;
+    4) flag_c="chacha20" ;;
+    5) flag_c="rc4-md5" ;;
+    6) flag_c="AEAD_CHACHA20_POLY1305" ;;
+    esac
   elif [ "$flag_a" == "socks" ]; then
     echo -e "-----------------------------------"
-    read -p "请输入socks用户名: " flag_c
+    prompt_nonempty "请输入socks用户名: " validate_no_space_or_delimiter "用户名不能为空，且不能包含空格或 #"
+    flag_c="$REPLY"
   elif [ "$flag_a" == "http" ]; then
     echo -e "-----------------------------------"
-    read -p "请输入http用户名: " flag_c
+    prompt_nonempty "请输入http用户名: " validate_no_space_or_delimiter "用户名不能为空，且不能包含空格或 #"
+    flag_c="$REPLY"
   elif [[ "$flag_a" == "peer"* ]]; then
     echo -e "------------------------------------------------------------------"
     echo -e "请输入落地列表文件名"
-    read -e -p "自定义但不同配置应不重复，不用输入后缀，例如ips1、iplist2: " flag_c
-    touch $flag_c.txt
+    while true; do
+      prompt_nonempty "自定义但不同配置应不重复，不用输入后缀，例如ips1、iplist2: " validate_filename_token "文件名只能包含字母、数字、点、下划线或中划线"
+      flag_c="$REPLY"
+      if [[ -e "/root/${flag_c}.txt" ]]; then
+        echo "文件 /root/${flag_c}.txt 已存在，请更换名称。"
+      else
+        break
+      fi
+    done
+    peer_tmp_file="/root/${flag_c}.txt"
+    touch "$peer_tmp_file"
     echo -e "------------------------------------------------------------------"
     echo -e "请依次输入你要均衡负载的落地ip与端口"
     while true; do
       echo -e "请问你要将本机从${flag_b}接收到的流量转发向的IP或域名?"
-      read -p "请输入: " peer_ip
+      prompt_nonempty "请输入: " validate_host "请输入合法的 IP 或域名"
+      peer_ip="$REPLY"
       echo -e "请问你要将本机从${flag_b}接收到的流量转发向${peer_ip}的哪个端口?"
-      read -p "请输入: " peer_port
-      echo -e "$peer_ip:$peer_port" >>$flag_c.txt
-      read -e -p "是否继续添加落地？[Y/n]:" addyn
-      [[ -z ${addyn} ]] && addyn="y"
-      if [[ ${addyn} == [Nn] ]]; then
+      prompt_nonempty "请输入: " validate_port "请输入合法端口（1-65535）"
+      peer_port="$REPLY"
+      echo -e "$peer_ip:$peer_port" >>"$peer_tmp_file"
+      if ! ask_yes_no "是否继续添加落地？[Y/n]:" "y"; then
         echo -e "------------------------------------------------------------------"
-        echo -e "已在root目录创建$flag_c.txt，您可以随时编辑该文件修改落地信息，重启gost即可生效"
+        echo -e "已在root目录创建${flag_c}.txt，您可以随时编辑该文件修改落地信息，重启gost即可生效"
         echo -e "------------------------------------------------------------------"
+        peer_tmp_file=""
         break
       else
         echo -e "------------------------------------------------------------------"
@@ -275,47 +473,54 @@ function read_d_ip() {
   elif [[ "$flag_a" == "cdn"* ]]; then
     echo -e "------------------------------------------------------------------"
     echo -e "将本机从${flag_b}接收到的流量转发向的自选ip:"
-    read -p "请输入: " flag_c
+    prompt_nonempty "请输入: " validate_host "请输入合法的 IP 或域名"
+    flag_c="$REPLY"
     echo -e "请问你要将本机从${flag_b}接收到的流量转发向${flag_c}的哪个端口?"
     echo -e "[1] 80"
     echo -e "[2] 443"
     echo -e "[3] 自定义端口（如8080等）"
-    read -p "请选择端口: " cdnport
+    prompt_choice "请选择端口: " 1 2 3
+    cdnport="$REPLY"
     if [ "$cdnport" == "1" ]; then
       flag_c="$flag_c:80"
     elif [ "$cdnport" == "2" ]; then
       flag_c="$flag_c:443"
     elif [ "$cdnport" == "3" ]; then
-      read -p "请输入自定义端口: " customport
+      prompt_nonempty "请输入自定义端口: " validate_port "请输入合法端口（1-65535）"
+      customport="$REPLY"
       flag_c="$flag_c:$customport"
-    else
-      echo "type error, please try again"
-      exit
     fi
   else
     echo -e "------------------------------------------------------------------"
     echo -e "请问你要将本机从${flag_b}接收到的流量转发向哪个IP或域名?"
     echo -e "注: IP既可以是[远程机器/当前机器]的公网IP, 也可是以本机本地回环IP(即127.0.0.1)"
-    echo -e "具体IP地址的填写, 取决于接收该流量的服务正在监听的IP(详见: https://github.com/KANIKIG/Multi-EasyGost)"
+    echo -e "具体IP地址的填写, 取决于接收该流量的服务正在监听的IP(详见: https://github.com/YeJianbo/Multi-EasyGost)"
     if [[ ${is_cert} == [Yy] ]]; then
       echo -e "注意: 落地机开启自定义tls证书，务必填写${Red_font_prefix}域名${Font_color_suffix}"
+      prompt_nonempty "请输入: " validate_host_header "请输入合法域名"
+      flag_c="$REPLY"
+    else
+      prompt_nonempty "请输入: " validate_host "请输入合法的 IP 或域名"
+      flag_c="$REPLY"
     fi
-    read -p "请输入: " flag_c
   fi
 }
 function read_d_port() {
   if [ "$flag_a" == "ss" ]; then
     echo -e "------------------------------------------------------------------"
     echo -e "请问你要设置ss代理服务的端口?"
-    read -p "请输入: " flag_d
+    prompt_nonempty "请输入: " validate_port "请输入合法端口（1-65535）"
+    flag_d="$REPLY"
   elif [ "$flag_a" == "socks" ]; then
     echo -e "------------------------------------------------------------------"
     echo -e "请问你要设置socks代理服务的端口?"
-    read -p "请输入: " flag_d
+    prompt_nonempty "请输入: " validate_port "请输入合法端口（1-65535）"
+    flag_d="$REPLY"
   elif [ "$flag_a" == "http" ]; then
     echo -e "------------------------------------------------------------------"
     echo -e "请问你要设置http代理服务的端口?"
-    read -p "请输入: " flag_d
+    prompt_nonempty "请输入: " validate_port "请输入合法端口（1-65535）"
+    flag_d="$REPLY"
   elif [[ "$flag_a" == "peer"* ]]; then
     echo -e "------------------------------------------------------------------"
     echo -e "您要设置的均衡负载策略: "
@@ -324,32 +529,31 @@ function read_d_port() {
     echo -e "[2] random - 随机"
     echo -e "[3] fifo - 自上而下"
     echo -e "-----------------------------------"
-    read -p "请选择均衡负载类型: " numstra
+    prompt_choice "请选择均衡负载类型: " 1 2 3
+    numstra="$REPLY"
 
-    if [ "$numstra" == "1" ]; then
-      flag_d="round"
-    elif [ "$numstra" == "2" ]; then
-      flag_d="random"
-    elif [ "$numstra" == "3" ]; then
-      flag_d="fifo"
-    else
-      echo "type error, please try again"
-      exit
-    fi
+    case "$numstra" in
+    1) flag_d="round" ;;
+    2) flag_d="random" ;;
+    3) flag_d="fifo" ;;
+    esac
   elif [[ "$flag_a" == "cdn"* ]]; then
     echo -e "------------------------------------------------------------------"
-    read -p "请输入host:" flag_d
+    prompt_nonempty "请输入host: " validate_host_header "请输入合法 Host"
+    flag_d="$REPLY"
   else
     echo -e "------------------------------------------------------------------"
     echo -e "请问你要将本机从${flag_b}接收到的流量转发向${flag_c}的哪个端口?"
-    read -p "请输入: " flag_d
+    prompt_nonempty "请输入: " validate_port "请输入合法端口（1-65535）"
+    flag_d="$REPLY"
     if [[ ${is_cert} == [Yy] ]]; then
       flag_d="$flag_d?secure=true"
     fi
   fi
 }
 function writerawconf() {
-  echo $flag_a"/""$flag_b""#""$flag_c""#""$flag_d" >>$raw_conf_path
+  ensure_raw_conf_file
+  echo "${flag_a}/${flag_b}#${flag_c}#${flag_d}" >>"$raw_conf_path"
 }
 function rawconf() {
   read_protocol
@@ -398,21 +602,27 @@ function encrypt() {
   echo -e "[3] wss隧道"
   echo -e "注意: 同一则转发，中转与落地传输类型必须对应！本脚本默认开启tcp+udp"
   echo -e "-----------------------------------"
-  read -p "请选择转发传输类型: " numencrypt
+  prompt_choice "请选择转发传输类型: " 1 2 3
+  numencrypt="$REPLY"
 
   if [ "$numencrypt" == "1" ]; then
     flag_a="encrypttls"
     echo -e "注意: 选择 是 将针对落地的自定义证书开启证书校验保证安全性，稍后落地机务必填写${Red_font_prefix}域名${Font_color_suffix}"
-    read -e -p "落地机是否开启了自定义tls证书？[y/n]:" is_cert
+    if ask_yes_no "落地机是否开启了自定义tls证书？[y/N]:" "n"; then
+      is_cert="y"
+    else
+      is_cert="n"
+    fi
   elif [ "$numencrypt" == "2" ]; then
     flag_a="encryptws"
   elif [ "$numencrypt" == "3" ]; then
     flag_a="encryptwss"
     echo -e "注意: 选择 是 将针对落地的自定义证书开启证书校验保证安全性，稍后落地机务必填写${Red_font_prefix}域名${Font_color_suffix}"
-    read -e -p "落地机是否开启了自定义tls证书？[y/n]:" is_cert
-  else
-    echo "type error, please try again"
-    exit
+    if ask_yes_no "落地机是否开启了自定义tls证书？[y/N]:" "n"; then
+      is_cert="y"
+    else
+      is_cert="n"
+    fi
   fi
 }
 function enpeer() {
@@ -426,7 +636,8 @@ function enpeer() {
   echo -e "此脚本仅支持简单型均衡负载，具体可参考官方文档"
   echo -e "gost均衡负载官方文档：https://docs.ginuerzh.xyz/gost/load-balancing"
   echo -e "-----------------------------------"
-  read -p "请选择转发传输类型: " numpeer
+  prompt_choice "请选择转发传输类型: " 1 2 3 4
+  numpeer="$REPLY"
 
   if [ "$numpeer" == "1" ]; then
     flag_a="peerno"
@@ -436,10 +647,6 @@ function enpeer() {
     flag_a="peerws"
   elif [ "$numpeer" == "4" ]; then
     flag_a="peerwss"
-
-  else
-    echo "type error, please try again"
-    exit
   fi
 }
 function cdn() {
@@ -451,7 +658,8 @@ function cdn() {
   echo -e "注意: 同一则转发，中转与落地传输类型必须对应！"
   echo -e "此功能只需在中转机设置"
   echo -e "-----------------------------------"
-  read -p "请选择CDN转发传输类型: " numcdn
+  prompt_choice "请选择CDN转发传输类型: " 1 2 3
+  numcdn="$REPLY"
 
   if [ "$numcdn" == "1" ]; then
     flag_a="cdnno"
@@ -459,9 +667,6 @@ function cdn() {
     flag_a="cdnws"
   elif [ "$numcdn" == "3" ]; then
     flag_a="cdnwss"
-  else
-    echo "type error, please try again"
-    exit
   fi
 }
 function cert() {
@@ -471,7 +676,8 @@ function cert() {
   echo -e "-----------------------------------"
   echo -e "说明: 仅用于落地机配置，默认使用的gost内置的证书可能带来安全问题，使用自定义证书提高安全性"
   echo -e "     配置后对本机所有tls/wss解密生效，无需再次设置"
-  read -p "请选择证书生成方式: " numcert
+  prompt_choice "请选择证书生成方式: " 1 2
+  numcert="$REPLY"
 
   if [ "$numcert" == "1" ]; then
     check_sys
@@ -480,8 +686,10 @@ function cert() {
     else
       apt-get install -y socat
     fi
-    read -p "请输入ZeroSSL的账户邮箱(至 zerossl.com 注册即可)：" zeromail
-    read -p "请输入解析到本机的域名：" domain
+    prompt_nonempty "请输入ZeroSSL的账户邮箱(至 zerossl.com 注册即可)：" "" "邮箱不能为空"
+    zeromail="$REPLY"
+    prompt_nonempty "请输入解析到本机的域名：" validate_host_header "请输入合法域名"
+    domain="$REPLY"
     curl https://get.acme.sh | sh
     "$HOME"/.acme.sh/acme.sh --set-default-ca --server zerossl
     "$HOME"/.acme.sh/acme.sh --register-account -m "${zeromail}" --server zerossl
@@ -490,7 +698,8 @@ function cert() {
     echo -e "[1] HTTP申请（需要80端口未占用）"
     echo -e "[2] Cloudflare DNS API 申请（需要输入APIKEY）"
     echo -e "-----------------------------------"
-    read -p "请选择证书申请方式: " certmethod
+    prompt_choice "请选择证书申请方式: " 1 2
+    certmethod="$REPLY"
     if [ "$certmethod" == "1" ]; then
       echo -e "请确认本机${Red_font_prefix}80${Font_color_suffix}端口未被占用, 否则会申请失败"
       if "$HOME"/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --force; then
@@ -508,8 +717,10 @@ function cert() {
         exit 1
       fi
     else
-      read -p "请输入Cloudflare账户邮箱：" cfmail
-      read -p "请输入Cloudflare Global API Key：" cfkey
+      prompt_nonempty "请输入Cloudflare账户邮箱：" "" "邮箱不能为空"
+      cfmail="$REPLY"
+      prompt_nonempty "请输入Cloudflare Global API Key：" "" "API Key 不能为空"
+      cfkey="$REPLY"
       export CF_Key="${cfkey}"
       export CF_Email="${cfmail}"
       if "$HOME"/.acme.sh/acme.sh --issue --dns dns_cf -d "${domain}" --standalone -k ec-256 --force; then
@@ -537,9 +748,6 @@ function cert() {
     echo -e "证书与秘钥文件名必须与上述一致，目录名也请勿更改"
     echo -e "上传成功后，用脚本重启gost会自动启用，无需再设置; 删除 gost_cert 目录后用脚本重启,即重新启用gost内置证书"
     echo -e "-----------------------------------"
-  else
-    echo "type error, please try again"
-    exit
   fi
 }
 function decrypt() {
@@ -550,7 +758,8 @@ function decrypt() {
   echo -e "[3] wss"
   echo -e "注意: 同一则转发，中转与落地传输类型必须对应！本脚本默认开启tcp+udp"
   echo -e "-----------------------------------"
-  read -p "请选择解密传输类型: " numdecrypt
+  prompt_choice "请选择解密传输类型: " 1 2 3
+  numdecrypt="$REPLY"
 
   if [ "$numdecrypt" == "1" ]; then
     flag_a="decrypttls"
@@ -558,9 +767,6 @@ function decrypt() {
     flag_a="decryptws"
   elif [ "$numdecrypt" == "3" ]; then
     flag_a="decryptwss"
-  else
-    echo "type error, please try again"
-    exit
   fi
 }
 function proxy() {
@@ -571,16 +777,14 @@ function proxy() {
   echo -e "[2] socks5(强烈建议加隧道用于Telegram代理)"
   echo -e "[3] http"
   echo -e "-----------------------------------"
-  read -p "请选择代理类型: " numproxy
+  prompt_choice "请选择代理类型: " 1 2 3
+  numproxy="$REPLY"
   if [ "$numproxy" == "1" ]; then
     flag_a="ss"
   elif [ "$numproxy" == "2" ]; then
     flag_a="socks"
   elif [ "$numproxy" == "3" ]; then
     flag_a="http"
-  else
-    echo "type error, please try again"
-    exit
   fi
 }
 function method() {
@@ -753,6 +957,9 @@ function method() {
 }
 
 function writeconf() {
+  if [[ ! -s "$raw_conf_path" ]]; then
+    return 0
+  fi
   count_line=$(awk 'END{print NR}' $raw_conf_path)
   for ((i = 1; i <= $count_line; i++)); do
     if [ $i -eq 1 ]; then
@@ -779,6 +986,11 @@ function writeconf() {
   done
 }
 function show_all_conf() {
+  ensure_raw_conf_file
+  if [[ ! -s "$raw_conf_path" ]]; then
+    echo -e "${Info} 当前没有任何 gost 配置。"
+    return 0
+  fi
   echo -e "                      GOST 配置                        "
   echo -e "--------------------------------------------------------"
   echo -e "序号|方法\t    |本地端口\t|目的地地址:目的地端口"
@@ -839,7 +1051,8 @@ cron_restart() {
   echo -e "[1] 配置gost定时重启任务"
   echo -e "[2] 删除gost定时重启任务"
   echo -e "-----------------------------------"
-  read -p "请选择: " numcron
+  prompt_choice "请选择: " 1 2
+  numcron="$REPLY"
   if [ "$numcron" == "1" ]; then
     echo -e "------------------------------------------------------------------"
     echo -e "gost定时重启任务类型: "
@@ -847,61 +1060,66 @@ cron_restart() {
     echo -e "[1] 每？小时重启"
     echo -e "[2] 每日？点重启"
     echo -e "-----------------------------------"
-    read -p "请选择: " numcrontype
+    prompt_choice "请选择: " 1 2
+    numcrontype="$REPLY"
     if [ "$numcrontype" == "1" ]; then
       echo -e "-----------------------------------"
-      read -p "每？小时重启: " cronhr
+      prompt_nonempty "每？小时重启: " validate_menu_number "请输入正整数小时数"
+      cronhr="$REPLY"
       echo "0 0 */$cronhr * * ? * systemctl restart gost" >>/etc/crontab
       echo -e "定时重启设置成功！"
     elif [ "$numcrontype" == "2" ]; then
       echo -e "-----------------------------------"
-      read -p "每日？点重启: " cronhr
+      prompt_nonempty "每日？点重启: " validate_menu_number "请输入 0-23 的整数"
+      cronhr="$REPLY"
+      if ((10#$cronhr < 0 || 10#$cronhr > 23)); then
+        echo "请输入 0-23 的整数"
+        return 1
+      fi
       echo "0 0 $cronhr * * ? systemctl restart gost" >>/etc/crontab
       echo -e "定时重启设置成功！"
-    else
-      echo "type error, please try again"
-      exit
     fi
   elif [ "$numcron" == "2" ]; then
     sed -i "/gost/d" /etc/crontab
     echo -e "定时重启任务删除完成！"
-  else
-    echo "type error, please try again"
-    exit
   fi
 }
 
 update_sh() {
-  ol_version=$(curl -L -s --connect-timeout 5 https://raw.githubusercontent.com/KANIKIG/Multi-EasyGost/master/gost.sh | grep "shell_version=" | head -1 | awk -F '=|"' '{print $3}')
+  local ol_version=""
+  if command -v curl >/dev/null 2>&1; then
+    ol_version=$(curl -L -s --connect-timeout 5 https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh | grep "shell_version=" | head -1 | awk -F '=|"' '{print $3}')
+  elif command -v wget >/dev/null 2>&1; then
+    ol_version=$(wget --no-check-certificate -qO- -t2 -T3 https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh | grep "shell_version=" | head -1 | awk -F '=|"' '{print $3}')
+  fi
   if [ -n "$ol_version" ]; then
     if [[ "$shell_version" != "$ol_version" ]]; then
       echo -e "存在新版本，是否更新 [Y/N]?"
-      read -r update_confirm
-      case $update_confirm in
-      [yY][eE][sS] | [yY])
-        wget -N --no-check-certificate https://raw.githubusercontent.com/KANIKIG/Multi-EasyGost/master/gost.sh
-        echo -e "更新完成"
-        exit 0
-        ;;
-      *) ;;
-
-      esac
+      if ask_yes_no "" "n"; then
+        if download_file "https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh" "$(pwd)/gost.sh"; then
+          chmod +x "$(pwd)/gost.sh"
+          echo -e "更新完成"
+          exit 0
+        else
+          echo -e "${Error} 更新失败，请检查网络。"
+        fi
+      fi
     else
       echo -e "                 ${Green_font_prefix}当前版本为最新版本！${Font_color_suffix}"
     fi
   else
-    echo -e "                 ${Red_font_prefix}脚本最新版本获取失败，请检查与github的连接！${Font_color_suffix}"
+    echo -e "                 ${Red_font_prefix}脚本最新版本获取失败，请检查与 GitHub 的连接！${Font_color_suffix}"
   fi
 }
 
 update_sh
 echo && echo -e "                 gost 一键安装配置脚本"${Red_font_prefix}[${shell_version}]${Font_color_suffix}"
-  ----------- KANIKIG -----------
+  ----------- YeJianbo -----------
   特性: (1)本脚本采用systemd及gost配置文件对gost进行管理
         (2)能够在不借助其他工具(如screen)的情况下实现多条转发规则同时生效
         (3)机器reboot后转发不失效
   功能: (1)tcp+udp不加密转发, (2)中转机加密转发, (3)落地机解密对接转发
-  帮助文档：https://github.com/KANIKIG/Multi-EasyGost
+  帮助文档：https://github.com/YeJianbo/Multi-EasyGost
 
  ${Green_font_prefix}1.${Font_color_suffix} 安装 gost
  ${Green_font_prefix}2.${Font_color_suffix} 更新 gost
@@ -918,7 +1136,8 @@ echo && echo -e "                 gost 一键安装配置脚本"${Red_font_prefi
  ${Green_font_prefix}10.${Font_color_suffix} gost定时重启配置
  ${Green_font_prefix}11.${Font_color_suffix} 自定义TLS证书配置
 ————————————" && echo
-read -e -p " 请输入数字 [1-9]:" num
+prompt_choice " 请输入数字 [1-11]:" 1 2 3 4 5 6 7 8 9 10 11
+num="$REPLY"
 case "$num" in
 1)
   Install_ct
@@ -939,32 +1158,41 @@ case "$num" in
   Restart_ct
   ;;
 7)
+  if ! is_gost_installed; then
+    echo -e "${Error} gost 尚未安装，请先安装。"
+    exit 1
+  fi
   rawconf
-  rm -rf /etc/gost/config.json
-  confstart
-  writeconf
-  conflast
-  systemctl restart gost
-  echo -e "配置已生效，当前配置如下"
-  echo -e "--------------------------------------------------------"
-  show_all_conf
+  if apply_runtime_config; then
+    echo -e "配置已生效，当前配置如下"
+    echo -e "--------------------------------------------------------"
+    show_all_conf
+  fi
   ;;
 8)
   show_all_conf
   ;;
 9)
+  if ! is_gost_installed; then
+    echo -e "${Error} gost 尚未安装，请先安装。"
+    exit 1
+  fi
   show_all_conf
-  read -p "请输入你要删除的配置编号：" numdelete
-  if echo $numdelete | grep -q '[0-9]'; then
-    sed -i "${numdelete}d" $raw_conf_path
-    rm -rf /etc/gost/config.json
-    confstart
-    writeconf
-    conflast
-    systemctl restart gost
+  if [[ ! -s "$raw_conf_path" ]]; then
+    exit 0
+  fi
+  count_line=$(awk 'END{print NR}' "$raw_conf_path")
+  while true; do
+    prompt_nonempty "请输入你要删除的配置编号：" validate_menu_number "请输入正确数字"
+    numdelete="$REPLY"
+    if ((10#$numdelete >= 1 && 10#$numdelete <= count_line)); then
+      break
+    fi
+    echo "编号超出范围，请输入 1-${count_line}"
+  done
+  sed -i "${numdelete}d" "$raw_conf_path"
+  if apply_runtime_config; then
     echo -e "配置已删除，服务已重启"
-  else
-    echo "请输入正确数字"
   fi
   ;;
 10)
@@ -974,6 +1202,6 @@ case "$num" in
   cert
   ;;
 *)
-  echo "请输入正确数字 [1-9]"
+  echo "请输入正确数字 [1-11]"
   ;;
 esac
