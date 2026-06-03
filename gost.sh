@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.3"
+shell_version="1.1.4"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -55,8 +55,64 @@ validate_no_space_or_delimiter() {
   [[ -n "$1" && "$1" != *"#"* && "$1" != *[[:space:]]* ]]
 }
 
+is_ipv4() {
+  local ip="$1"
+  local IFS=.
+  local parts=()
+  read -r -a parts <<<"$ip"
+  [[ ${#parts[@]} -eq 4 ]] || return 1
+  local part
+  for part in "${parts[@]}"; do
+    [[ "$part" =~ ^[0-9]+$ ]] || return 1
+    ((10#$part >= 0 && 10#$part <= 255)) || return 1
+  done
+}
+
+is_ipv6() {
+  local ip="$1"
+  [[ "$ip" == *:* ]] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY' "$ip"
+import ipaddress
+import sys
+try:
+    ipaddress.IPv6Address(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+    return $?
+  fi
+  [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]]
+}
+
+is_hostname() {
+  local host="$1"
+  [[ "$host" =~ [A-Za-z-] ]] || return 1
+  [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+  [[ "$host" != .* && "$host" != *. && "$host" != *..* ]] || return 1
+}
+
+normalize_host() {
+  local host="$1"
+  if [[ "$host" =~ ^\[[^][]+\]$ ]]; then
+    printf '%s' "$host"
+    return 0
+  fi
+  if is_ipv6 "$host"; then
+    printf '[%s]' "$host"
+    return 0
+  fi
+  printf '%s' "$host"
+}
+
 validate_host() {
-  [[ "$1" =~ ^[A-Za-z0-9._:-]+$ ]]
+  local host="$1"
+  if [[ "$host" =~ ^\[(.*)\]$ ]]; then
+    is_ipv6 "${BASH_REMATCH[1]}"
+    return $?
+  fi
+  is_ipv4 "$host" || is_ipv6 "$host" || is_hostname "$host"
 }
 
 validate_host_header() {
@@ -532,7 +588,7 @@ function read_d_ip() {
     while true; do
       echo -e "请问你要将本机从${flag_b}接收到的流量转发向的IP或域名?"
       prompt_nonempty "请输入: " validate_host "请输入合法的 IP 或域名"
-      peer_ip="$REPLY"
+      peer_ip=$(normalize_host "$REPLY")
       echo -e "请问你要将本机从${flag_b}接收到的流量转发向${peer_ip}的哪个端口?"
       prompt_nonempty "请输入: " validate_port "请输入合法端口（1-65535）"
       peer_port="$REPLY"
@@ -552,7 +608,7 @@ function read_d_ip() {
     echo -e "------------------------------------------------------------------"
     echo -e "将本机从${flag_b}接收到的流量转发向的自选ip:"
     prompt_nonempty "请输入: " validate_host "请输入合法的 IP 或域名"
-    flag_c="$REPLY"
+    flag_c=$(normalize_host "$REPLY")
     echo -e "请问你要将本机从${flag_b}接收到的流量转发向${flag_c}的哪个端口?"
     echo -e "[1] 80"
     echo -e "[2] 443"
@@ -579,7 +635,7 @@ function read_d_ip() {
       flag_c="$REPLY"
     else
       prompt_nonempty "请输入: " validate_host "请输入合法的 IP 或域名"
-      flag_c="$REPLY"
+      flag_c=$(normalize_host "$REPLY")
     fi
   fi
 }
