@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.5"
+shell_version="1.1.6"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -303,31 +303,19 @@ list_peer_files_from_rawconf() {
   done <"${source_rawconf}"
 }
 
-export_rules() {
-  local export_dir=""
-  local export_file=""
-  local export_tmp_dir=""
+prepare_rule_bundle() {
+  local source_rawconf="$1"
+  local target_dir="$2"
   local peer_file=""
   local missing_peer=0
+  local selected_rule=""
 
-  check_root
-  ensure_raw_conf_file
-  if [[ ! -s "$raw_conf_path" ]]; then
-    echo -e "${Error} 当前没有可导出的规则。"
-    return 1
-  fi
-
-  export_tmp_dir=$(mktemp -d /tmp/gost-export.XXXXXX) || {
-    echo -e "${Error} 无法创建导出临时目录。"
-    return 1
-  }
-  mkdir -p "${export_tmp_dir}/peer_files"
-
-  cp "$raw_conf_path" "${export_tmp_dir}/rawconf"
+  mkdir -p "${target_dir}/peer_files"
+  cp "${source_rawconf}" "${target_dir}/rawconf"
   if [[ -f "$gost_conf_path" ]]; then
-    cp "$gost_conf_path" "${export_tmp_dir}/config.json"
+    cp "$gost_conf_path" "${target_dir}/config.json"
   fi
-  cat >"${export_tmp_dir}/manifest.txt" <<EOF
+  cat >"${target_dir}/manifest.txt" <<EOF
 shell_version=${shell_version}
 export_time=$(date '+%Y-%m-%d %H:%M:%S %z')
 rawconf_path=${raw_conf_path}
@@ -340,84 +328,66 @@ EOF
       missing_peer=1
       continue
     fi
-    cp "${peer_file}" "${export_tmp_dir}/peer_files/"
-  done < <(list_peer_files_from_rawconf "$raw_conf_path" | sort -u)
+    cp "${peer_file}" "${target_dir}/peer_files/"
+  done < <(list_peer_files_from_rawconf "${source_rawconf}" | sort -u)
 
-  if [[ ${missing_peer} -ne 0 ]]; then
-    rm -rf "${export_tmp_dir}"
-    return 1
-  fi
-
-  export_dir="/root"
-  export_file="${export_dir}/gost-rules-$(date +%Y%m%d-%H%M%S).tar.gz"
-  if tar -czf "${export_file}" -C "${export_tmp_dir}" .; then
-    echo -e "${Info} 规则已导出到：${export_file}"
-  else
-    echo -e "${Error} 规则导出失败。"
-    rm -rf "${export_tmp_dir}"
-    return 1
-  fi
-  rm -rf "${export_tmp_dir}"
+  [[ ${missing_peer} -eq 0 ]]
 }
 
-import_rules() {
-  local import_path=""
-  local unpack_dir=""
+build_selected_rawconf() {
+  local output_rawconf="$1"
+  local selected_index=""
+  local total_rules=0
+
+  ensure_raw_conf_file
+  if [[ ! -s "$raw_conf_path" ]]; then
+    echo -e "${Error} 当前没有可导出的规则。"
+    return 1
+  fi
+
+  show_all_conf
+  total_rules=$(awk 'END{print NR}' "$raw_conf_path")
+  while true; do
+    prompt_nonempty "请输入要导出的规则编号：" validate_menu_number "请输入正确数字"
+    selected_index="$REPLY"
+    if ((10#$selected_index >= 1 && 10#$selected_index <= total_rules)); then
+      break
+    fi
+    echo "编号超出范围，请输入 1-${total_rules}"
+  done
+
+  sed -n "${selected_index}p" "$raw_conf_path" >"${output_rawconf}"
+  [[ -s "${output_rawconf}" ]]
+}
+
+write_bundle_archive() {
+  local source_dir="$1"
+  local output_file="$2"
+  tar -czf "${output_file}" -C "${source_dir}" .
+}
+
+apply_import_bundle() {
+  local imported_rawconf="$1"
+  local unpack_dir="$2"
+  local import_mode="$3"
   local backup_dir=""
-  local imported_rawconf=""
   local peer_file=""
   local basename_peer=""
   local peer_rel_path=""
+  local merged_rawconf=""
   local missing_peer_list=""
 
-  check_root
-  if ! is_gost_installed; then
-    echo -e "${Error} gost 尚未安装，请先安装。"
-    return 1
-  fi
-
-  prompt_nonempty "请输入导入文件路径: " "" "导入文件路径不能为空"
-  import_path="$REPLY"
-  if [[ "${import_path}" != /* ]]; then
-    import_path="$(pwd)/${import_path}"
-  fi
-  if [[ ! -f "${import_path}" ]]; then
-    echo -e "${Error} 导入文件不存在：${import_path}"
-    return 1
-  fi
-  if ! ask_yes_no "导入会覆盖当前规则，是否继续？[y/N]:" "n"; then
-    return 0
-  fi
-
-  unpack_dir=$(mktemp -d /tmp/gost-import.XXXXXX) || {
-    echo -e "${Error} 无法创建导入临时目录。"
-    return 1
-  }
   backup_dir=$(mktemp -d /tmp/gost-import-backup.XXXXXX) || {
-    rm -rf "${unpack_dir}"
     echo -e "${Error} 无法创建备份目录。"
     return 1
   }
-
-  if ! tar -xzf "${import_path}" -C "${unpack_dir}"; then
-    rm -rf "${unpack_dir}" "${backup_dir}"
-    echo -e "${Error} 导入包解压失败。"
-    return 1
-  fi
-
-  imported_rawconf="${unpack_dir}/rawconf"
-  if [[ ! -s "${imported_rawconf}" ]]; then
-    rm -rf "${unpack_dir}" "${backup_dir}"
-    echo -e "${Error} 导入包缺少 rawconf 或规则为空。"
-    return 1
-  fi
 
   while IFS= read -r peer_file; do
     [[ -n "${peer_file}" ]] || continue
     basename_peer="$(basename "${peer_file}")"
     peer_rel_path="${unpack_dir}/peer_files/${basename_peer}"
     if [[ ! -f "${peer_rel_path}" ]]; then
-      rm -rf "${unpack_dir}" "${backup_dir}"
+      rm -rf "${backup_dir}"
       echo -e "${Error} 导入包缺少依赖的落地列表文件：${basename_peer}"
       return 1
     fi
@@ -435,9 +405,25 @@ import_rules() {
     else
       echo "${peer_file}" >>"${backup_dir}/missing_peer_files.txt"
     fi
-  done < <(list_peer_files_from_rawconf "${imported_rawconf}" | sort -u)
+  done < <(list_peer_files_from_rawconf "$raw_conf_path" | sort -u)
 
-  cp "${imported_rawconf}" "$raw_conf_path"
+  if [[ "${import_mode}" == "append" && -s "$raw_conf_path" ]]; then
+    merged_rawconf=$(mktemp /tmp/gost-rawconf-merged.XXXXXX) || {
+      rm -rf "${backup_dir}"
+      echo -e "${Error} 无法创建合并配置临时文件。"
+      return 1
+    }
+    cat "$raw_conf_path" >"${merged_rawconf}"
+    if [[ -s "${merged_rawconf}" && -s "${imported_rawconf}" ]]; then
+      printf '\n' >>"${merged_rawconf}"
+    fi
+    cat "${imported_rawconf}" >>"${merged_rawconf}"
+    cp "${merged_rawconf}" "$raw_conf_path"
+    rm -f "${merged_rawconf}"
+  else
+    cp "${imported_rawconf}" "$raw_conf_path"
+  fi
+
   while IFS= read -r peer_file; do
     [[ -n "${peer_file}" ]] || continue
     basename_peer="$(basename "${peer_file}")"
@@ -448,7 +434,7 @@ import_rules() {
     echo -e "${Info} 规则导入成功，当前配置如下"
     echo -e "--------------------------------------------------------"
     show_all_conf
-    rm -rf "${unpack_dir}" "${backup_dir}"
+    rm -rf "${backup_dir}"
     return 0
   fi
 
@@ -473,8 +459,203 @@ import_rules() {
     done <"${missing_peer_list}"
   fi
   apply_runtime_config >/dev/null 2>&1
-  rm -rf "${unpack_dir}" "${backup_dir}"
+  rm -rf "${backup_dir}"
   return 1
+}
+
+export_rules() {
+  local export_dir=""
+  local export_file=""
+  local export_tmp_dir=""
+
+  check_root
+  ensure_raw_conf_file
+  if [[ ! -s "$raw_conf_path" ]]; then
+    echo -e "${Error} 当前没有可导出的规则。"
+    return 1
+  fi
+
+  export_tmp_dir=$(mktemp -d /tmp/gost-export.XXXXXX) || {
+    echo -e "${Error} 无法创建导出临时目录。"
+    return 1
+  }
+  if ! prepare_rule_bundle "$raw_conf_path" "${export_tmp_dir}"; then
+    rm -rf "${export_tmp_dir}"
+    return 1
+  fi
+
+  export_dir="/root"
+  export_file="${export_dir}/gost-rules-$(date +%Y%m%d-%H%M%S).tar.gz"
+  if write_bundle_archive "${export_tmp_dir}" "${export_file}"; then
+    echo -e "${Info} 规则已导出到：${export_file}"
+  else
+    echo -e "${Error} 规则导出失败。"
+    rm -rf "${export_tmp_dir}"
+    return 1
+  fi
+  rm -rf "${export_tmp_dir}"
+}
+
+import_rules() {
+  local import_path=""
+  local unpack_dir=""
+  local imported_rawconf=""
+
+  check_root
+  if ! is_gost_installed; then
+    echo -e "${Error} gost 尚未安装，请先安装。"
+    return 1
+  fi
+
+  prompt_nonempty "请输入导入文件路径: " "" "导入文件路径不能为空"
+  import_path="$REPLY"
+  if [[ "${import_path}" != /* ]]; then
+    import_path="$(pwd)/${import_path}"
+  fi
+  if [[ ! -f "${import_path}" ]]; then
+    echo -e "${Error} 导入文件不存在：${import_path}"
+    return 1
+  fi
+  if ! ask_yes_no "导入会覆盖当前规则，是否继续？[y/N]:" "n"; then
+    return 0
+  fi
+
+  unpack_dir=$(mktemp -d /tmp/gost-import.XXXXXX) || {
+    echo -e "${Error} 无法创建导入临时目录。"
+    return 1
+  }
+
+  if ! tar -xzf "${import_path}" -C "${unpack_dir}"; then
+    rm -rf "${unpack_dir}"
+    echo -e "${Error} 导入包解压失败。"
+    return 1
+  fi
+
+  imported_rawconf="${unpack_dir}/rawconf"
+  if [[ ! -s "${imported_rawconf}" ]]; then
+    rm -rf "${unpack_dir}"
+    echo -e "${Error} 导入包缺少 rawconf 或规则为空。"
+    return 1
+  fi
+
+  apply_import_bundle "${imported_rawconf}" "${unpack_dir}" "overwrite"
+  local import_status=$?
+  rm -rf "${unpack_dir}"
+  return ${import_status}
+}
+
+export_share_code() {
+  local export_mode=""
+  local export_tmp_dir=""
+  local share_rawconf=""
+  local share_archive=""
+  local share_code=""
+
+  check_root
+  ensure_raw_conf_file
+  if [[ ! -s "$raw_conf_path" ]]; then
+    echo -e "${Error} 当前没有可导出的规则。"
+    return 1
+  fi
+
+  echo -e "分享码导出类型:"
+  echo -e "[1] 导出单条规则分享码"
+  echo -e "[2] 导出全部规则分享码"
+  prompt_choice "请选择: " 1 2
+  export_mode="$REPLY"
+
+  export_tmp_dir=$(mktemp -d /tmp/gost-share-export.XXXXXX) || {
+    echo -e "${Error} 无法创建分享码临时目录。"
+    return 1
+  }
+
+  if [[ "${export_mode}" == "1" ]]; then
+    share_rawconf="${export_tmp_dir}/selected.rawconf"
+    if ! build_selected_rawconf "${share_rawconf}"; then
+      rm -rf "${export_tmp_dir}"
+      return 1
+    fi
+  else
+    share_rawconf="$raw_conf_path"
+  fi
+
+  if ! prepare_rule_bundle "${share_rawconf}" "${export_tmp_dir}/bundle"; then
+    rm -rf "${export_tmp_dir}"
+    return 1
+  fi
+
+  share_archive="${export_tmp_dir}/rules.tar.gz"
+  if ! write_bundle_archive "${export_tmp_dir}/bundle" "${share_archive}"; then
+    echo -e "${Error} 分享码生成失败。"
+    rm -rf "${export_tmp_dir}"
+    return 1
+  fi
+
+  share_code="MEG1:$(base64 -w0 "${share_archive}")"
+  echo -e "${Info} 分享码如下，复制整串即可："
+  echo "${share_code}"
+  rm -rf "${export_tmp_dir}"
+}
+
+import_share_code() {
+  local share_code=""
+  local payload=""
+  local unpack_dir=""
+  local archive_file=""
+  local imported_rawconf=""
+  local import_mode=""
+
+  check_root
+  if ! is_gost_installed; then
+    echo -e "${Error} gost 尚未安装，请先安装。"
+    return 1
+  fi
+
+  prompt_nonempty "请粘贴分享码: " "" "分享码不能为空"
+  share_code="$REPLY"
+  if [[ "${share_code}" != MEG1:* ]]; then
+    echo -e "${Error} 分享码格式不正确。"
+    return 1
+  fi
+  payload="${share_code#MEG1:}"
+
+  echo -e "分享码导入方式:"
+  echo -e "[1] 追加到现有规则"
+  echo -e "[2] 覆盖现有规则"
+  prompt_choice "请选择: " 1 2
+  if [[ "$REPLY" == "1" ]]; then
+    import_mode="append"
+  else
+    import_mode="overwrite"
+  fi
+
+  unpack_dir=$(mktemp -d /tmp/gost-share-import.XXXXXX) || {
+    echo -e "${Error} 无法创建分享码导入临时目录。"
+    return 1
+  }
+  archive_file="${unpack_dir}/rules.tar.gz"
+  if ! printf '%s' "${payload}" | base64 -d >"${archive_file}" 2>/dev/null; then
+    rm -rf "${unpack_dir}"
+    echo -e "${Error} 分享码解码失败。"
+    return 1
+  fi
+  if ! tar -xzf "${archive_file}" -C "${unpack_dir}"; then
+    rm -rf "${unpack_dir}"
+    echo -e "${Error} 分享码内容解压失败。"
+    return 1
+  fi
+
+  imported_rawconf="${unpack_dir}/rawconf"
+  if [[ ! -s "${imported_rawconf}" ]]; then
+    rm -rf "${unpack_dir}"
+    echo -e "${Error} 分享码缺少有效规则。"
+    return 1
+  fi
+
+  apply_import_bundle "${imported_rawconf}" "${unpack_dir}" "${import_mode}"
+  local import_status=$?
+  rm -rf "${unpack_dir}"
+  return ${import_status}
 }
 
 function checknew() {
@@ -1464,8 +1645,10 @@ echo && echo -e "                 gost 一键安装配置脚本"${Red_font_prefi
  ${Green_font_prefix}11.${Font_color_suffix} 自定义TLS证书配置
  ${Green_font_prefix}12.${Font_color_suffix} 导出规则包
  ${Green_font_prefix}13.${Font_color_suffix} 导入规则包
+ ${Green_font_prefix}14.${Font_color_suffix} 导出分享码
+ ${Green_font_prefix}15.${Font_color_suffix} 导入分享码
 ————————————" && echo
-prompt_choice " 请输入数字 [1-13]:" 1 2 3 4 5 6 7 8 9 10 11 12 13
+prompt_choice " 请输入数字 [1-15]:" 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
 num="$REPLY"
 case "$num" in
 1)
@@ -1536,7 +1719,13 @@ case "$num" in
 13)
   import_rules
   ;;
+14)
+  export_share_code
+  ;;
+15)
+  import_share_code
+  ;;
 *)
-  echo "请输入正确数字 [1-13]"
+  echo "请输入正确数字 [1-15]"
   ;;
 esac
