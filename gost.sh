@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.4"
+shell_version="1.1.5"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -281,6 +281,199 @@ apply_runtime_config() {
     return 0
   fi
   echo -e "${Error} gost 重启失败，请检查配置内容。"
+  return 1
+}
+
+list_peer_files_from_rawconf() {
+  local source_rawconf="$1"
+  local line=""
+  local rule_type=""
+  local target_name=""
+  [[ -f "${source_rawconf}" ]] || return 0
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    rule_type="${line%%/*}"
+    if [[ "${rule_type}" == peer* ]]; then
+      target_name="${line#*#}"
+      target_name="${target_name%%#*}"
+      if validate_filename_token "${target_name}"; then
+        echo "/root/${target_name}.txt"
+      fi
+    fi
+  done <"${source_rawconf}"
+}
+
+export_rules() {
+  local export_dir=""
+  local export_file=""
+  local export_tmp_dir=""
+  local peer_file=""
+  local missing_peer=0
+
+  check_root
+  ensure_raw_conf_file
+  if [[ ! -s "$raw_conf_path" ]]; then
+    echo -e "${Error} 当前没有可导出的规则。"
+    return 1
+  fi
+
+  export_tmp_dir=$(mktemp -d /tmp/gost-export.XXXXXX) || {
+    echo -e "${Error} 无法创建导出临时目录。"
+    return 1
+  }
+  mkdir -p "${export_tmp_dir}/peer_files"
+
+  cp "$raw_conf_path" "${export_tmp_dir}/rawconf"
+  if [[ -f "$gost_conf_path" ]]; then
+    cp "$gost_conf_path" "${export_tmp_dir}/config.json"
+  fi
+  cat >"${export_tmp_dir}/manifest.txt" <<EOF
+shell_version=${shell_version}
+export_time=$(date '+%Y-%m-%d %H:%M:%S %z')
+rawconf_path=${raw_conf_path}
+EOF
+
+  while IFS= read -r peer_file; do
+    [[ -n "${peer_file}" ]] || continue
+    if [[ ! -f "${peer_file}" ]]; then
+      echo -e "${Error} 规则引用的落地列表文件不存在：${peer_file}"
+      missing_peer=1
+      continue
+    fi
+    cp "${peer_file}" "${export_tmp_dir}/peer_files/"
+  done < <(list_peer_files_from_rawconf "$raw_conf_path" | sort -u)
+
+  if [[ ${missing_peer} -ne 0 ]]; then
+    rm -rf "${export_tmp_dir}"
+    return 1
+  fi
+
+  export_dir="/root"
+  export_file="${export_dir}/gost-rules-$(date +%Y%m%d-%H%M%S).tar.gz"
+  if tar -czf "${export_file}" -C "${export_tmp_dir}" .; then
+    echo -e "${Info} 规则已导出到：${export_file}"
+  else
+    echo -e "${Error} 规则导出失败。"
+    rm -rf "${export_tmp_dir}"
+    return 1
+  fi
+  rm -rf "${export_tmp_dir}"
+}
+
+import_rules() {
+  local import_path=""
+  local unpack_dir=""
+  local backup_dir=""
+  local imported_rawconf=""
+  local peer_file=""
+  local basename_peer=""
+  local peer_rel_path=""
+  local missing_peer_list=""
+
+  check_root
+  if ! is_gost_installed; then
+    echo -e "${Error} gost 尚未安装，请先安装。"
+    return 1
+  fi
+
+  prompt_nonempty "请输入导入文件路径: " "" "导入文件路径不能为空"
+  import_path="$REPLY"
+  if [[ "${import_path}" != /* ]]; then
+    import_path="$(pwd)/${import_path}"
+  fi
+  if [[ ! -f "${import_path}" ]]; then
+    echo -e "${Error} 导入文件不存在：${import_path}"
+    return 1
+  fi
+  if ! ask_yes_no "导入会覆盖当前规则，是否继续？[y/N]:" "n"; then
+    return 0
+  fi
+
+  unpack_dir=$(mktemp -d /tmp/gost-import.XXXXXX) || {
+    echo -e "${Error} 无法创建导入临时目录。"
+    return 1
+  }
+  backup_dir=$(mktemp -d /tmp/gost-import-backup.XXXXXX) || {
+    rm -rf "${unpack_dir}"
+    echo -e "${Error} 无法创建备份目录。"
+    return 1
+  }
+
+  if ! tar -xzf "${import_path}" -C "${unpack_dir}"; then
+    rm -rf "${unpack_dir}" "${backup_dir}"
+    echo -e "${Error} 导入包解压失败。"
+    return 1
+  fi
+
+  imported_rawconf="${unpack_dir}/rawconf"
+  if [[ ! -s "${imported_rawconf}" ]]; then
+    rm -rf "${unpack_dir}" "${backup_dir}"
+    echo -e "${Error} 导入包缺少 rawconf 或规则为空。"
+    return 1
+  fi
+
+  while IFS= read -r peer_file; do
+    [[ -n "${peer_file}" ]] || continue
+    basename_peer="$(basename "${peer_file}")"
+    peer_rel_path="${unpack_dir}/peer_files/${basename_peer}"
+    if [[ ! -f "${peer_rel_path}" ]]; then
+      rm -rf "${unpack_dir}" "${backup_dir}"
+      echo -e "${Error} 导入包缺少依赖的落地列表文件：${basename_peer}"
+      return 1
+    fi
+  done < <(list_peer_files_from_rawconf "${imported_rawconf}" | sort -u)
+
+  mkdir -p "${backup_dir}/peer_files"
+  if [[ -f "$raw_conf_path" ]]; then
+    cp "$raw_conf_path" "${backup_dir}/rawconf"
+  fi
+  while IFS= read -r peer_file; do
+    [[ -n "${peer_file}" ]] || continue
+    basename_peer="$(basename "${peer_file}")"
+    if [[ -f "${peer_file}" ]]; then
+      cp "${peer_file}" "${backup_dir}/peer_files/${basename_peer}"
+    else
+      echo "${peer_file}" >>"${backup_dir}/missing_peer_files.txt"
+    fi
+  done < <(list_peer_files_from_rawconf "${imported_rawconf}" | sort -u)
+
+  cp "${imported_rawconf}" "$raw_conf_path"
+  while IFS= read -r peer_file; do
+    [[ -n "${peer_file}" ]] || continue
+    basename_peer="$(basename "${peer_file}")"
+    cp "${unpack_dir}/peer_files/${basename_peer}" "${peer_file}"
+  done < <(list_peer_files_from_rawconf "${imported_rawconf}" | sort -u)
+
+  if apply_runtime_config; then
+    echo -e "${Info} 规则导入成功，当前配置如下"
+    echo -e "--------------------------------------------------------"
+    show_all_conf
+    rm -rf "${unpack_dir}" "${backup_dir}"
+    return 0
+  fi
+
+  echo -e "${Error} 导入后的规则未能成功生效，正在回滚。"
+  if [[ -f "${backup_dir}/rawconf" ]]; then
+    cp "${backup_dir}/rawconf" "$raw_conf_path"
+  else
+    : >"$raw_conf_path"
+  fi
+  while IFS= read -r peer_file; do
+    [[ -n "${peer_file}" ]] || continue
+    basename_peer="$(basename "${peer_file}")"
+    if [[ -f "${backup_dir}/peer_files/${basename_peer}" ]]; then
+      cp "${backup_dir}/peer_files/${basename_peer}" "${peer_file}"
+    fi
+  done < <(list_peer_files_from_rawconf "$raw_conf_path" | sort -u)
+  missing_peer_list="${backup_dir}/missing_peer_files.txt"
+  if [[ -f "${missing_peer_list}" ]]; then
+    while IFS= read -r peer_file; do
+      [[ -n "${peer_file}" ]] || continue
+      rm -f "${peer_file}"
+    done <"${missing_peer_list}"
+  fi
+  apply_runtime_config >/dev/null 2>&1
+  rm -rf "${unpack_dir}" "${backup_dir}"
   return 1
 }
 
@@ -1269,8 +1462,10 @@ echo && echo -e "                 gost 一键安装配置脚本"${Red_font_prefi
 ————————————
  ${Green_font_prefix}10.${Font_color_suffix} gost定时重启配置
  ${Green_font_prefix}11.${Font_color_suffix} 自定义TLS证书配置
+ ${Green_font_prefix}12.${Font_color_suffix} 导出规则包
+ ${Green_font_prefix}13.${Font_color_suffix} 导入规则包
 ————————————" && echo
-prompt_choice " 请输入数字 [1-11]:" 1 2 3 4 5 6 7 8 9 10 11
+prompt_choice " 请输入数字 [1-13]:" 1 2 3 4 5 6 7 8 9 10 11 12 13
 num="$REPLY"
 case "$num" in
 1)
@@ -1335,7 +1530,13 @@ case "$num" in
 11)
   cert
   ;;
+12)
+  export_rules
+  ;;
+13)
+  import_rules
+  ;;
 *)
-  echo "请输入正确数字 [1-11]"
+  echo "请输入正确数字 [1-13]"
   ;;
 esac
