@@ -8,21 +8,35 @@
 ## 简介
 
 > 项目地址及帮助文档:  
-> https://github.com/KANIKIG/Multi-EasyGost
+> https://github.com/YeJianbo/Multi-EasyGost
 ***
 ## 脚本
 
 * 启动脚本  
-  `wget --no-check-certificate -O gost.sh https://raw.githubusercontent.com/KANIKIG/Multi-EasyGost/master/gost.sh && chmod +x gost.sh && ./gost.sh`  
+  `wget --no-check-certificate -O gost.sh https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh && chmod +x gost.sh && ./gost.sh`  
 * 再次运行本脚本只需要输入`./gost.sh`回车即可  
 
 > 注：由于 gost v2.11.2 功能稳定，此脚本将一直采用该版本，后续不再跟随官方更新
+
+## 系统支持
+
+- Debian / Ubuntu
+- CentOS / Red Hat
+- Alpine
+
+### Alpine 说明
+
+- Alpine 默认使用 `OpenRC`，脚本会自动安装 `/etc/init.d/gost`
+- 启停服务会自动使用 `rc-service`
+- 开机自启会自动使用 `rc-update`
+- 定时任务会写入 `/etc/crontabs/root`
+- 依赖安装会自动使用 `apk add`
 
 ## 功能
 
 ### 原脚本功能
 
-- 实现了systemd及gost配置文件对gost进行管理
+- 实现了服务管理及 gost 配置文件管理
 - 在不借助其他工具(如screen)的情况下实现多条转发规则同时生效
 - 机器reboot后转发不失效
 - 支持传输类型：
@@ -37,11 +51,52 @@
   - relay+wss
 - 落地机一键创建ss/socks5/http代理 (gost内置)
 - 支持多传输类型的多落地简单型均衡负载
-- ~~增加gost国内加速下载镜像~~（被恶意刷流量导致我损失，不再提供）
+- 自动测速并选择更合适的下载源
 - 简单创建或删除gost定时重启任务
 - 脚本自动检查更新
 - 转发CDN自选节点ip
 - 支持自定义tls证书，落地可一键申请证书，中转可开启证书校验
+- 输入校验增强，避免误输端口、非法主机名、重复安装等导致脚本出错
+- 支持 IPv6 自动规范化，裸 IPv6 会自动转为 `[ipv6]`
+- 支持规则包一键导出 / 导入
+- 支持分享码一键导出 / 导入，可直接复制整串字符串跨机器迁移规则
+
+## 新增菜单
+
+- `12` 导出规则包
+- `13` 导入规则包
+- `14` 导出分享码
+- `15` 导入分享码
+
+## 规则迁移
+
+### 方式一：规则包
+
+- 导出后会生成 `/root/gost-rules-时间戳.tar.gz`
+- 包含：
+  - `rawconf`
+  - `config.json`
+  - 均衡负载使用到的 `/root/*.txt` 落地列表文件
+- 适合本机备份、跨机器完整迁移
+
+### 方式二：分享码
+
+- 适合直接复制一串字符串到另一台机器
+- 支持：
+  - 单条规则分享
+  - 全部规则分享
+- 分享码格式示例：
+  - `MEG1:......`
+- 在目标机器执行脚本后，选择 `15`，粘贴整串分享码即可导入
+- 导入时可选：
+  - 追加到现有规则
+  - 覆盖现有规则
+
+## 使用建议
+
+- 独立 IP 机器之间迁移单条规则，优先使用 `14` / `15` 分享码
+- 需要连同多落地负载列表一起迁移时，优先使用 `12` / `13` 规则包
+- 如果是 Alpine，请确认系统已正常启用 `OpenRC`
 
 ## 功能展示
 
