@@ -2,12 +2,14 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.6"
+shell_version="1.1.7"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
 install_tmp_dir=""
 peer_tmp_file=""
+release=""
+service_manager=""
 
 cleanup_temp() {
   if [[ -n "${install_tmp_dir}" && -d "${install_tmp_dir}" ]]; then
@@ -31,7 +33,7 @@ trap cleanup_temp EXIT
 trap handle_interrupt INT TERM
 
 is_gost_installed() {
-  command -v gost >/dev/null 2>&1 || [[ -f /usr/bin/gost || -f /usr/lib/systemd/system/gost.service || -d /etc/gost ]]
+  command -v gost >/dev/null 2>&1 || [[ -f /usr/bin/gost || -f /usr/lib/systemd/system/gost.service || -f /etc/init.d/gost || -d /etc/gost ]]
 }
 
 ensure_gost_dir() {
@@ -41,6 +43,90 @@ ensure_gost_dir() {
 ensure_raw_conf_file() {
   ensure_gost_dir
   touch "$raw_conf_path"
+}
+
+get_service_unit_path() {
+  if [[ "${service_manager}" == "openrc" ]]; then
+    printf '%s' "/etc/init.d/gost"
+  else
+    printf '%s' "/usr/lib/systemd/system/gost.service"
+  fi
+}
+
+write_openrc_service() {
+  local target_path="$1"
+  cat >"${target_path}" <<'EOF'
+#!/sbin/openrc-run
+
+name="gost"
+description="gost proxy service"
+command="/usr/bin/gost"
+command_args="-C /etc/gost/config.json"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+supervisor="supervise-daemon"
+retry="TERM/30/KILL/5"
+
+depend() {
+  need net
+  after firewall
+}
+EOF
+}
+
+reload_service_manager() {
+  if [[ "${service_manager}" == "openrc" ]]; then
+    return 0
+  fi
+  systemctl daemon-reload
+}
+
+enable_gost_service() {
+  if [[ "${service_manager}" == "openrc" ]]; then
+    rc-update add gost default >/dev/null 2>&1
+  else
+    systemctl enable gost >/dev/null 2>&1
+  fi
+}
+
+disable_gost_service() {
+  if [[ "${service_manager}" == "openrc" ]]; then
+    rc-update del gost default >/dev/null 2>&1
+  else
+    systemctl disable gost >/dev/null 2>&1
+  fi
+}
+
+service_action() {
+  local action="$1"
+  if [[ "${service_manager}" == "openrc" ]]; then
+    rc-service gost "${action}"
+  else
+    systemctl "${action}" gost
+  fi
+}
+
+get_restart_command() {
+  if [[ "${service_manager}" == "openrc" ]]; then
+    printf '%s' "rc-service gost restart"
+  else
+    printf '%s' "systemctl restart gost"
+  fi
+}
+
+get_cron_file() {
+  if [[ "${release}" == "alpine" ]]; then
+    printf '%s' "/etc/crontabs/root"
+  else
+    printf '%s' "/etc/crontab"
+  fi
+}
+
+append_cron_line() {
+  local cron_line="$1"
+  local cron_file=""
+  cron_file=$(get_cron_file)
+  echo "${cron_line}" >>"${cron_file}"
 }
 
 validate_port() {
@@ -272,12 +358,13 @@ rebuild_config() {
 
 apply_runtime_config() {
   check_root
+  check_sys
   if ! is_gost_installed; then
     echo -e "${Error} gost 尚未安装，请先安装。"
     return 1
   fi
   rebuild_config
-  if systemctl restart gost; then
+  if service_action restart; then
     return 0
   fi
   echo -e "${Error} gost 重启失败，请检查配置内容。"
@@ -672,18 +759,36 @@ function checknew() {
 function check_sys() {
   if [[ -f /etc/redhat-release ]]; then
     release="centos"
+  elif [[ -f /etc/alpine-release ]]; then
+    release="alpine"
   elif cat /etc/issue | grep -q -E -i "debian"; then
     release="debian"
+  elif cat /etc/issue | grep -q -E -i "alpine"; then
+    release="alpine"
   elif cat /etc/issue | grep -q -E -i "ubuntu"; then
     release="ubuntu"
   elif cat /etc/issue | grep -q -E -i "centos|red hat|redhat"; then
     release="centos"
   elif cat /proc/version | grep -q -E -i "debian"; then
     release="debian"
+  elif cat /proc/version | grep -q -E -i "alpine"; then
+    release="alpine"
   elif cat /proc/version | grep -q -E -i "ubuntu"; then
     release="ubuntu"
   elif cat /proc/version | grep -q -E -i "centos|red hat|redhat"; then
     release="centos"
+  fi
+  if [[ -z "${release}" ]]; then
+    release="unknown"
+  fi
+  if [[ "${release}" == "alpine" ]]; then
+    service_manager="openrc"
+  elif command -v systemctl >/dev/null 2>&1; then
+    service_manager="systemd"
+  elif command -v rc-service >/dev/null 2>&1; then
+    service_manager="openrc"
+  else
+    service_manager="systemd"
   fi
   bit=$(uname -m)
   case "$bit" in
@@ -707,6 +812,9 @@ function Installation_dependency() {
     if [[ ${release} == "centos" ]]; then
       yum update
       yum install -y gzip wget curl ca-certificates
+    elif [[ ${release} == "alpine" ]]; then
+      apk update
+      apk add gzip wget curl ca-certificates
     else
       apt-get update
       apt-get install -y gzip wget curl ca-certificates
@@ -727,6 +835,13 @@ function check_new_ver() {
   fi
 }
 function check_file() {
+  if [[ "${service_manager}" == "openrc" ]]; then
+    if test ! -d "/etc/init.d/"; then
+      mkdir -p /etc/init.d
+      chmod 755 /etc/init.d
+    fi
+    return 0
+  fi
   if test ! -d "/usr/lib/systemd/system/"; then
     mkdir /usr/lib/systemd/system
     chmod 755 /usr/lib/systemd/system
@@ -787,9 +902,11 @@ function Install_ct() {
     echo -e "${Error} gost 二进制解压失败。"
     return 1
   fi
-  if ! download_file "${service_url}" "${install_tmp_dir}/gost.service"; then
-    echo -e "${Error} gost.service 下载失败。"
-    return 1
+  if [[ "${service_manager}" == "systemd" ]]; then
+    if ! download_file "${service_url}" "${install_tmp_dir}/gost.service"; then
+      echo -e "${Error} gost.service 下载失败。"
+      return 1
+    fi
   fi
 
   ensure_gost_dir
@@ -802,18 +919,23 @@ function Install_ct() {
   fi
 
   install -m 755 "${binary_plain}" /usr/bin/gost
-  install -m 644 "${install_tmp_dir}/gost.service" /usr/lib/systemd/system/gost.service
+  if [[ "${service_manager}" == "openrc" ]]; then
+    write_openrc_service /etc/init.d/gost
+    chmod 755 /etc/init.d/gost
+  else
+    install -m 644 "${install_tmp_dir}/gost.service" /usr/lib/systemd/system/gost.service
+  fi
   ensure_raw_conf_file
 
-  systemctl daemon-reload
-  systemctl enable gost >/dev/null 2>&1
-  if ! systemctl restart gost; then
+  reload_service_manager
+  enable_gost_service
+  if ! service_action restart; then
     echo -e "${Error} gost 安装完成，但服务启动失败，请检查现有配置。"
     return 1
   fi
 
   echo "------------------------------"
-  if test -a /usr/bin/gost -a /usr/lib/systemd/system/gost.service -a /etc/gost/config.json; then
+  if test -a /usr/bin/gost -a "$(get_service_unit_path)" -a /etc/gost/config.json; then
     echo "gost安装成功"
   else
     echo "gost没有安装成功"
@@ -822,34 +944,38 @@ function Install_ct() {
 }
 function Uninstall_ct() {
   check_root
+  check_sys
   if ! is_gost_installed; then
     echo -e "${Info} gost 当前未安装。"
     return 0
   fi
-  systemctl stop gost >/dev/null 2>&1
-  systemctl disable gost >/dev/null 2>&1
+  service_action stop >/dev/null 2>&1
+  disable_gost_service
   rm -rf /usr/bin/gost
   rm -rf /usr/lib/systemd/system/gost.service
+  rm -rf /etc/init.d/gost
   rm -rf /etc/gost
-  systemctl daemon-reload
+  reload_service_manager
   echo "gost已经成功删除"
 }
 function Start_ct() {
   check_root
+  check_sys
   if ! is_gost_installed; then
     echo -e "${Error} gost 尚未安装。"
     return 1
   fi
-  systemctl start gost
+  service_action start
   echo "已启动"
 }
 function Stop_ct() {
   check_root
+  check_sys
   if ! is_gost_installed; then
     echo -e "${Error} gost 尚未安装。"
     return 1
   fi
-  systemctl stop gost
+  service_action stop
   echo "已停止"
 }
 function Restart_ct() {
@@ -1191,6 +1317,8 @@ function cert() {
     check_sys
     if [[ ${release} == "centos" ]]; then
       yum install -y socat
+    elif [[ ${release} == "alpine" ]]; then
+      apk add socat
     else
       apt-get install -y socat
     fi
@@ -1553,6 +1681,7 @@ function show_all_conf() {
 }
 
 cron_restart() {
+  check_sys
   echo -e "------------------------------------------------------------------"
   echo -e "gost定时重启任务: "
   echo -e "-----------------------------------"
@@ -1574,7 +1703,11 @@ cron_restart() {
       echo -e "-----------------------------------"
       prompt_nonempty "每？小时重启: " validate_menu_number "请输入正整数小时数"
       cronhr="$REPLY"
-      echo "0 0 */$cronhr * * ? * systemctl restart gost" >>/etc/crontab
+      if [[ "${release}" == "alpine" ]]; then
+        append_cron_line "0 */$cronhr * * * $(get_restart_command)"
+      else
+        append_cron_line "0 */$cronhr * * * root $(get_restart_command)"
+      fi
       echo -e "定时重启设置成功！"
     elif [ "$numcrontype" == "2" ]; then
       echo -e "-----------------------------------"
@@ -1584,11 +1717,15 @@ cron_restart() {
         echo "请输入 0-23 的整数"
         return 1
       fi
-      echo "0 0 $cronhr * * ? systemctl restart gost" >>/etc/crontab
+      if [[ "${release}" == "alpine" ]]; then
+        append_cron_line "0 $cronhr * * * $(get_restart_command)"
+      else
+        append_cron_line "0 $cronhr * * * root $(get_restart_command)"
+      fi
       echo -e "定时重启设置成功！"
     fi
   elif [ "$numcron" == "2" ]; then
-    sed -i "/gost/d" /etc/crontab
+    sed -i "/gost/d" "$(get_cron_file)"
     echo -e "定时重启任务删除完成！"
   fi
 }
