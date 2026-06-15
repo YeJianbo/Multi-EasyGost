@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.15"
+shell_version="1.1.16"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -2983,6 +2983,22 @@ process_cli_args() {
   return 2
 }
 
+prompt_install_if_missing() {
+  if is_gost_installed; then
+    return 0
+  fi
+
+  echo -e "${Info} 检测到本机尚未安装 gost。"
+  if ask_yes_no "是否现在安装 gost？[Y/n]:" "y"; then
+    if ! Install_ct; then
+      echo -e "${Error} gost 安装失败。"
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
 main() {
   if process_cli_args "$@"; then
     return 0
@@ -2994,6 +3010,9 @@ main() {
   fi
 
   update_sh "$@"
+  if ! prompt_install_if_missing; then
+    return 1
+  fi
   while true; do
     show_main_menu
     handle_main_menu
