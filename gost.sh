@@ -2845,12 +2845,12 @@ show_main_menu() {
  ${Green_font_prefix}7.${Font_color_suffix} 新增gost转发配置
  ${Green_font_prefix}8.${Font_color_suffix} 查看现有gost配置
  ${Green_font_prefix}9.${Font_color_suffix} 删除一则gost配置
- ${Green_font_prefix}14.${Font_color_suffix} 修改一则gost配置
+ ${Green_font_prefix}10.${Font_color_suffix} 修改一则gost配置
 ————————————
- ${Green_font_prefix}10.${Font_color_suffix} gost定时重启配置
- ${Green_font_prefix}11.${Font_color_suffix} 自定义TLS证书配置
- ${Green_font_prefix}12.${Font_color_suffix} 导出分享码
- ${Green_font_prefix}13.${Font_color_suffix} 导入分享码
+ ${Green_font_prefix}11.${Font_color_suffix} gost定时重启配置
+ ${Green_font_prefix}12.${Font_color_suffix} 自定义TLS证书配置
+ ${Green_font_prefix}13.${Font_color_suffix} 导出分享码
+ ${Green_font_prefix}14.${Font_color_suffix} 导入分享码
 ————————————" && echo
 }
 
@@ -2916,19 +2916,19 @@ handle_main_menu() {
   fi
   ;;
 10)
-  cron_restart
+  modify_conf
   ;;
 11)
-  cert
+  cron_restart
   ;;
 12)
-  export_share_code
+  cert
   ;;
 13)
-  import_share_code
+  export_share_code
   ;;
 14)
-  modify_conf
+  import_share_code
   ;;
 *)
   echo "请输入正确数字 [1-14]"
