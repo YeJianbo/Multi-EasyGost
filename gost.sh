@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.11"
+shell_version="1.1.12"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -121,6 +121,43 @@ get_cron_file() {
   else
     printf '%s' "/etc/crontab"
   fi
+}
+
+get_tmp_base_dir() {
+  if [[ -n "${TMPDIR}" && -d "${TMPDIR}" ]]; then
+    printf '%s' "${TMPDIR}"
+  elif [[ -d /tmp ]]; then
+    printf '%s' "/tmp"
+  else
+    printf '%s' "."
+  fi
+}
+
+make_temp_dir() {
+  local prefix="$1"
+  local tmp_base=""
+  local template=""
+  tmp_base="$(get_tmp_base_dir)"
+  template="${prefix}.XXXXXX"
+
+  mktemp -d "${tmp_base%/}/${template}" 2>/dev/null && return 0
+  mktemp -d -p "${tmp_base}" "${template}" 2>/dev/null && return 0
+  mktemp -d -t "${prefix}.XXXXXX" 2>/dev/null && return 0
+  return 1
+}
+
+make_temp_file() {
+  local prefix="$1"
+  local suffix="$2"
+  local tmp_base=""
+  local template=""
+  tmp_base="$(get_tmp_base_dir)"
+  template="${prefix}.XXXXXX${suffix}"
+
+  mktemp "${tmp_base%/}/${template}" 2>/dev/null && return 0
+  mktemp -p "${tmp_base}" "${template}" 2>/dev/null && return 0
+  mktemp -t "${prefix}.XXXXXX${suffix}" 2>/dev/null && return 0
+  return 1
 }
 
 append_cron_line() {
@@ -389,6 +426,21 @@ normalize_share_code() {
   printf '%s' "${input}" | tr -d '[:space:]'
 }
 
+read_prompt_line() {
+  local prompt="$1"
+  local answer=""
+
+  if [[ -t 0 && -t 1 ]]; then
+    if read -e -r -p "$prompt" answer 2>/dev/null; then
+      REPLY="${answer}"
+      return 0
+    fi
+  fi
+
+  read -r -p "$prompt" answer
+  REPLY="${answer}"
+}
+
 validate_share_code_length() {
   local share_code="$1"
   local code_length=0
@@ -405,8 +457,8 @@ ask_yes_no() {
   local default_value="$2"
   local answer
   while true; do
-    read -r -p "$prompt" answer
-    answer=$(normalize_input "$answer")
+    read_prompt_line "$prompt"
+    answer=$(normalize_input "$REPLY")
     [[ -z "${answer}" ]] && answer="${default_value}"
     case "${answer}" in
     [Yy] | [Yy][Ee][Ss])
@@ -427,8 +479,8 @@ prompt_choice() {
   shift
   local answer
   while true; do
-    read -r -p "$prompt" answer
-    answer=$(normalize_input "$answer")
+    read_prompt_line "$prompt"
+    answer=$(normalize_input "$REPLY")
     for option in "$@"; do
       if [[ "${answer}" == "${option}" ]]; then
         REPLY="${answer}"
@@ -445,8 +497,8 @@ prompt_nonempty() {
   local error_message="$3"
   local answer
   while true; do
-    read -r -p "$prompt" answer
-    answer=$(normalize_input "$answer")
+    read_prompt_line "$prompt"
+    answer=$(normalize_input "$REPLY")
     if [[ -n "${answer}" ]] && { [[ -z "${validator}" ]] || "${validator}" "${answer}"; }; then
       REPLY="${answer}"
       return 0
@@ -457,7 +509,7 @@ prompt_nonempty() {
 
 pause_before_menu() {
   echo
-  read -r -p "按回车返回主菜单..."
+  read_prompt_line "按回车返回主菜单..."
 }
 
 download_file() {
@@ -632,8 +684,8 @@ build_selected_rawconf() {
   fi
 
   while true; do
-    read -r -p "请输入要导出的规则编号，支持 1,3,5-7；直接回车导出全部: " selected_expr
-    selected_expr=$(normalize_input "${selected_expr}")
+    read_prompt_line "请输入要导出的规则编号，支持 1,3,5-7；直接回车导出全部: "
+    selected_expr=$(normalize_input "${REPLY}")
     selected_expr="${selected_expr// /}"
     if [[ -z "${selected_expr}" ]]; then
       cp "$raw_conf_path" "${output_rawconf}"
@@ -706,7 +758,7 @@ apply_import_bundle() {
   local merged_rawconf=""
   local missing_peer_list=""
 
-  backup_dir=$(mktemp -d /tmp/gost-import-backup.XXXXXX) || {
+  backup_dir=$(make_temp_dir "gost-import-backup") || {
     echo -e "${Error} 无法创建备份目录。"
     return 1
   }
@@ -737,7 +789,7 @@ apply_import_bundle() {
   done < <(list_peer_files_from_rawconf "$raw_conf_path" | sort -u)
 
   if [[ "${import_mode}" == "append" && -s "$raw_conf_path" ]]; then
-    merged_rawconf=$(mktemp /tmp/gost-rawconf-merged.XXXXXX) || {
+    merged_rawconf=$(make_temp_file "gost-rawconf-merged" "") || {
       rm -rf "${backup_dir}"
       echo -e "${Error} 无法创建合并配置临时文件。"
       return 1
@@ -804,7 +856,7 @@ export_rules() {
     return 1
   fi
 
-  export_tmp_dir=$(mktemp -d /tmp/gost-export.XXXXXX) || {
+  export_tmp_dir=$(make_temp_dir "gost-export") || {
     echo -e "${Error} 无法创建导出临时目录。"
     return 1
   }
@@ -846,7 +898,7 @@ import_rules() {
     return 1
   fi
 
-  unpack_dir=$(mktemp -d /tmp/gost-import.XXXXXX) || {
+  unpack_dir=$(make_temp_dir "gost-import") || {
     echo -e "${Error} 无法创建导入临时目录。"
     return 1
   }
@@ -899,7 +951,7 @@ export_share_code() {
   prompt_choice "请选择: " 1 2 3
   export_mode="$REPLY"
 
-  export_tmp_dir=$(mktemp -d /tmp/gost-share-export.XXXXXX) || {
+  export_tmp_dir=$(make_temp_dir "gost-share-export") || {
     echo -e "${Error} 无法创建分享码临时目录。"
     return 1
   }
@@ -977,7 +1029,7 @@ import_share_code() {
     import_mode="overwrite"
   fi
 
-  unpack_dir=$(mktemp -d /tmp/gost-share-import.XXXXXX) || {
+  unpack_dir=$(make_temp_dir "gost-share-import") || {
     echo -e "${Error} 无法创建分享码导入临时目录。"
     return 1
   }
@@ -1145,7 +1197,7 @@ function Install_ct() {
     echo -e "${Info} 已自动选择海外源下载。"
   fi
 
-  install_tmp_dir=$(mktemp -d /tmp/gost-install.XXXXXX) || {
+  install_tmp_dir=$(make_temp_dir "gost-install") || {
     echo -e "${Error} 无法创建临时目录。"
     return 1
   }
@@ -2163,7 +2215,7 @@ update_sh() {
   if [ -n "$ol_version" ]; then
     if [[ "$shell_version" != "$ol_version" ]]; then
       echo -e "${Info} 检测到新版本，正在自动更新脚本..."
-      temp_script=$(mktemp /tmp/gost-update.XXXXXX.sh) || {
+      temp_script=$(make_temp_file "gost-update" ".sh") || {
         echo -e "${Error} 无法创建更新临时文件。"
         return 1
       }
