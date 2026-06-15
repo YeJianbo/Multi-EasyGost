@@ -455,6 +455,11 @@ prompt_nonempty() {
   done
 }
 
+pause_before_menu() {
+  echo
+  read -r -p "按回车返回主菜单..."
+}
+
 download_file() {
   local url="$1"
   local output="$2"
@@ -2286,6 +2291,7 @@ handle_main_menu() {
   echo "请输入正确数字 [1-13]"
   ;;
   esac
+  pause_before_menu
 }
 
 main() {
