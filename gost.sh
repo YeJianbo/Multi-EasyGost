@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.12"
+shell_version="1.1.13"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -424,6 +424,12 @@ normalize_input() {
 normalize_share_code() {
   local input="$1"
   printf '%s' "${input}" | tr -d '[:space:]'
+}
+
+build_migration_command() {
+  local share_code="$1"
+  local import_mode="${2:-overwrite}"
+  printf "%s" "bash <(curl -fsSL https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh) --import-share-code '${share_code}' --import-mode ${import_mode}"
 }
 
 read_prompt_line() {
@@ -936,6 +942,7 @@ export_share_code() {
   local share_rawconf=""
   local share_archive=""
   local share_code=""
+  local answer=""
 
   check_root
   ensure_raw_conf_file
@@ -948,8 +955,20 @@ export_share_code() {
   echo -e "[1] 导出单条规则分享码"
   echo -e "[2] 导出多条规则分享码"
   echo -e "[3] 导出全部规则分享码"
-  prompt_choice "请选择: " 1 2 3
-  export_mode="$REPLY"
+  while true; do
+    read_prompt_line "请选择（默认 3）: "
+    answer=$(normalize_input "$REPLY")
+    [[ -z "${answer}" ]] && answer="3"
+    case "${answer}" in
+    1 | 2 | 3)
+      export_mode="${answer}"
+      break
+      ;;
+    *)
+      echo "请输入正确选项: 1 2 3"
+      ;;
+    esac
+  done
 
   export_tmp_dir=$(make_temp_dir "gost-share-export") || {
     echo -e "${Error} 无法创建分享码临时目录。"
@@ -991,10 +1010,13 @@ export_share_code() {
   fi
   echo -e "${Info} 分享码如下，复制整串即可："
   echo "${share_code}"
+  echo
+  echo -e "${Info} 新机器一键迁移命令如下："
+  build_migration_command "${share_code}" "overwrite"
   rm -rf "${export_tmp_dir}"
 }
 
-import_share_code() {
+import_share_code_value() {
   local share_code=""
   local payload=""
   local unpack_dir=""
@@ -1002,14 +1024,8 @@ import_share_code() {
   local imported_rawconf=""
   local import_mode=""
 
-  check_root
-  if ! is_gost_installed; then
-    echo -e "${Error} gost 尚未安装，请先安装。"
-    return 1
-  fi
-
-  prompt_nonempty "请粘贴分享码: " "" "分享码不能为空"
-  share_code=$(normalize_share_code "$REPLY")
+  share_code=$(normalize_share_code "$1")
+  import_mode="${2:-overwrite}"
   if [[ "${share_code}" != MEG1:* ]]; then
     echo -e "${Error} 分享码格式不正确。"
     return 1
@@ -1018,15 +1034,9 @@ import_share_code() {
     return 1
   fi
   payload="${share_code#MEG1:}"
-
-  echo -e "分享码导入方式:"
-  echo -e "[1] 追加到现有规则"
-  echo -e "[2] 覆盖现有规则"
-  prompt_choice "请选择: " 1 2
-  if [[ "$REPLY" == "1" ]]; then
-    import_mode="append"
-  else
-    import_mode="overwrite"
+  if [[ "${import_mode}" != "append" && "${import_mode}" != "overwrite" ]]; then
+    echo -e "${Error} 导入模式不正确，仅支持 append 或 overwrite。"
+    return 1
   fi
 
   unpack_dir=$(make_temp_dir "gost-share-import") || {
@@ -1064,6 +1074,32 @@ import_share_code() {
   local import_status=$?
   rm -rf "${unpack_dir}"
   return ${import_status}
+}
+
+import_share_code() {
+  local share_code=""
+  local import_mode=""
+
+  check_root
+  if ! is_gost_installed; then
+    echo -e "${Error} gost 尚未安装，请先安装。"
+    return 1
+  fi
+
+  prompt_nonempty "请粘贴分享码: " "" "分享码不能为空"
+  share_code="$REPLY"
+
+  echo -e "分享码导入方式:"
+  echo -e "[1] 追加到现有规则"
+  echo -e "[2] 覆盖现有规则"
+  prompt_choice "请选择: " 1 2
+  if [[ "$REPLY" == "1" ]]; then
+    import_mode="append"
+  else
+    import_mode="overwrite"
+  fi
+
+  import_share_code_value "${share_code}" "${import_mode}"
 }
 
 function checknew() {
@@ -1507,10 +1543,13 @@ function read_d_port() {
   fi
 }
 function writerawconf() {
-  ensure_raw_conf_file
-  echo "${flag_a}/${flag_b}#${flag_c}#${flag_d}" >>"$raw_conf_path"
+  local target_rawconf="${1:-$raw_conf_path}"
+  ensure_gost_dir
+  touch "$target_rawconf"
+  echo "${flag_a}/${flag_b}#${flag_c}#${flag_d}" >>"$target_rawconf"
 }
 function rawconf() {
+  local target_rawconf="${1:-$raw_conf_path}"
   flag_a=""
   flag_b=""
   flag_c=""
@@ -1520,7 +1559,7 @@ function rawconf() {
   read_s_port
   read_d_ip
   read_d_port
-  writerawconf
+  writerawconf "$target_rawconf"
 }
 function eachconf_retrieve() {
   d_server=${trans_conf#*#}
@@ -2205,6 +2244,7 @@ update_sh() {
   local ol_version=""
   local script_path=""
   local temp_script=""
+  local -a forward_args=("$@")
   script_path="${BASH_SOURCE[0]}"
   [[ "${script_path}" != /* ]] && script_path="$(pwd)/${script_path}"
   if command -v curl >/dev/null 2>&1; then
@@ -2233,7 +2273,7 @@ update_sh() {
       mv "${temp_script}" "${script_path}"
       chmod +x "${script_path}"
       echo -e "${Info} 脚本已自动更新，正在重载。"
-      exec bash "${script_path}"
+      exec bash "${script_path}" "${forward_args[@]}"
     fi
   fi
 }
@@ -2346,12 +2386,67 @@ handle_main_menu() {
   pause_before_menu
 }
 
+process_cli_args() {
+  local share_code=""
+  local import_mode="overwrite"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --import-share-code)
+      [[ $# -ge 2 ]] || {
+        echo -e "${Error} --import-share-code 缺少参数。"
+        return 1
+      }
+      share_code="$2"
+      shift 2
+      ;;
+    --import-mode)
+      [[ $# -ge 2 ]] || {
+        echo -e "${Error} --import-mode 缺少参数。"
+        return 1
+      }
+      import_mode="$2"
+      shift 2
+      ;;
+    *)
+      echo -e "${Error} 不支持的参数：$1"
+      return 1
+      ;;
+    esac
+  done
+
+  if [[ -n "${share_code}" ]]; then
+    check_root
+    check_sys
+    if ! is_gost_installed; then
+      echo -e "${Info} 检测到 gost 尚未安装，正在自动安装..."
+      if ! Install_ct; then
+        echo -e "${Error} gost 自动安装失败。"
+        return 1
+      fi
+    fi
+    import_share_code_value "${share_code}" "${import_mode}"
+    return $?
+  fi
+
+  return 2
+}
+
 main() {
-  update_sh
+  if process_cli_args "$@"; then
+    return 0
+  else
+    local cli_status=$?
+    if [[ ${cli_status} -ne 2 ]]; then
+      return ${cli_status}
+    fi
+  fi
+
+  update_sh "$@"
   while true; do
     show_main_menu
     handle_main_menu
   done
 }
 
-main
+main "$@"
