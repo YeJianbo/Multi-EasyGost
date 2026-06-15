@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.13"
+shell_version="1.1.14"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -151,12 +151,31 @@ make_temp_file() {
   local suffix="$2"
   local tmp_base=""
   local template=""
+  local temp_path=""
   tmp_base="$(get_tmp_base_dir)"
-  template="${prefix}.XXXXXX${suffix}"
+  template="${prefix}.XXXXXX"
 
-  mktemp "${tmp_base%/}/${template}" 2>/dev/null && return 0
-  mktemp -p "${tmp_base}" "${template}" 2>/dev/null && return 0
-  mktemp -t "${prefix}.XXXXXX${suffix}" 2>/dev/null && return 0
+  temp_path=$(mktemp "${tmp_base%/}/${template}" 2>/dev/null) && {
+    if [[ -n "${suffix}" ]]; then
+      mv "${temp_path}" "${temp_path}${suffix}" 2>/dev/null && temp_path="${temp_path}${suffix}"
+    fi
+    printf '%s\n' "${temp_path}"
+    return 0
+  }
+  temp_path=$(mktemp -p "${tmp_base}" "${template}" 2>/dev/null) && {
+    if [[ -n "${suffix}" ]]; then
+      mv "${temp_path}" "${temp_path}${suffix}" 2>/dev/null && temp_path="${temp_path}${suffix}"
+    fi
+    printf '%s\n' "${temp_path}"
+    return 0
+  }
+  temp_path=$(mktemp -t "${prefix}.XXXXXX" 2>/dev/null) && {
+    if [[ -n "${suffix}" ]]; then
+      mv "${temp_path}" "${temp_path}${suffix}" 2>/dev/null && temp_path="${temp_path}${suffix}"
+    fi
+    printf '%s\n' "${temp_path}"
+    return 0
+  }
   return 1
 }
 
@@ -2254,20 +2273,17 @@ update_sh() {
   fi
   if [ -n "$ol_version" ]; then
     if [[ "$shell_version" != "$ol_version" ]]; then
-      echo -e "${Info} 检测到新版本，正在自动更新脚本..."
       temp_script=$(make_temp_file "gost-update" ".sh") || {
-        echo -e "${Error} 无法创建更新临时文件。"
-        return 1
+        return 0
       }
+      echo -e "${Info} 检测到新版本，正在自动更新脚本..."
       if ! download_file "https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh" "${temp_script}"; then
         rm -f "${temp_script}"
-        echo -e "${Error} 自动更新失败，请检查网络。"
-        return 1
+        return 0
       fi
       if ! bash -n "${temp_script}" >/dev/null 2>&1; then
         rm -f "${temp_script}"
-        echo -e "${Error} 下载到的新脚本语法检查失败，已取消自动更新。"
-        return 1
+        return 0
       fi
       chmod +x "${temp_script}"
       mv "${temp_script}" "${script_path}"
