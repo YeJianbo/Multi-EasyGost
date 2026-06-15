@@ -209,6 +209,159 @@ validate_filename_token() {
   [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
 }
 
+validate_bundle_entry_name() {
+  local entry="$1"
+  entry="${entry#./}"
+  case "${entry}" in
+  "" | "." | "./")
+    return 0
+    ;;
+  rawconf | config.json | manifest.txt)
+    return 0
+    ;;
+  peer_files | peer_files/)
+    return 0
+    ;;
+  peer_files/*.txt)
+    validate_filename_token "$(basename "${entry}" .txt)"
+    return $?
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+validate_bundle_archive() {
+  local archive_file="$1"
+  local entry_name=""
+  local verbose_line=""
+  if ! tar -tzf "${archive_file}" >/dev/null 2>&1; then
+    echo -e "${Error} 归档文件无法读取或格式错误。"
+    return 1
+  fi
+  while IFS= read -r entry_name; do
+    [[ -n "${entry_name}" ]] || continue
+    if [[ "${entry_name}" == /* || "${entry_name}" == *"../"* || "${entry_name}" == ../* || "${entry_name}" == *"..\\"* ]]; then
+      echo -e "${Error} 归档包含非法路径：${entry_name}"
+      return 1
+    fi
+    if ! validate_bundle_entry_name "${entry_name}"; then
+      echo -e "${Error} 归档包含不受支持的文件：${entry_name}"
+      return 1
+    fi
+  done < <(tar -tzf "${archive_file}")
+
+  while IFS= read -r verbose_line; do
+    [[ -n "${verbose_line}" ]] || continue
+    case "${verbose_line:0:1}" in
+    l | h)
+      echo -e "${Error} 归档中不允许符号链接或硬链接。"
+      return 1
+      ;;
+    esac
+  done < <(tar -tvzf "${archive_file}")
+}
+
+safe_extract_bundle() {
+  local archive_file="$1"
+  local target_dir="$2"
+  if ! validate_bundle_archive "${archive_file}"; then
+    return 1
+  fi
+  tar -xzf "${archive_file}" -C "${target_dir}"
+}
+
+validate_host_port_pair() {
+  local host_port="$1"
+  local host_part=""
+  local port_part=""
+  if [[ "${host_port}" =~ ^(\[[^][]+\]):([0-9]+)$ ]]; then
+    host_part="${BASH_REMATCH[1]}"
+    port_part="${BASH_REMATCH[2]}"
+  elif [[ "${host_port}" =~ ^([^:]+):([0-9]+)$ ]]; then
+    host_part="${BASH_REMATCH[1]}"
+    port_part="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+  validate_host "${host_part}" && validate_port "${port_part}"
+}
+
+validate_rawconf_line() {
+  local line="$1"
+  local head=""
+  local field_target=""
+  local field_value=""
+  local rule_type=""
+  local source_value=""
+
+  [[ -n "${line}" ]] || return 1
+  [[ "${line}" != *'"'* && "${line}" != *'\'* ]] || return 1
+  [[ "${line}" == */*#*#* ]] || return 1
+
+  head="${line%%#*}"
+  field_target="${line#*#}"
+  field_value="${field_target#*#}"
+  field_target="${field_target%%#*}"
+  rule_type="${head%%/*}"
+  source_value="${head#*/}"
+
+  case "${rule_type}" in
+  nonencrypt | encrypttls | encryptws | encryptwss | decrypttls | decryptws | decryptwss)
+    validate_port "${source_value}" || return 1
+    ;;
+  peerno | peertls | peerws | peerwss | cdnno | cdnws | cdnwss)
+    validate_port "${source_value}" || return 1
+    ;;
+  ss | socks | http)
+    validate_no_space_or_delimiter "${source_value}" || return 1
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+
+  case "${rule_type}" in
+  nonencrypt | encrypttls | encryptws | encryptwss | decrypttls | decryptws | decryptwss)
+    validate_host "${field_target}" || validate_host_header "${field_target}" || return 1
+    [[ "${field_value}" == *"?secure=true" ]] && field_value="${field_value%\?secure=true}"
+    validate_port "${field_value}" || return 1
+    ;;
+  ss)
+    validate_no_space_or_delimiter "${source_value}" || return 1
+    [[ "${field_target}" == "aes-256-gcm" || "${field_target}" == "aes-256-cfb" || "${field_target}" == "chacha20-ietf-poly1305" || "${field_target}" == "chacha20" || "${field_target}" == "rc4-md5" || "${field_target}" == "AEAD_CHACHA20_POLY1305" ]] || return 1
+    validate_port "${field_value}" || return 1
+    ;;
+  socks | http)
+    validate_no_space_or_delimiter "${source_value}" || return 1
+    validate_no_space_or_delimiter "${field_target}" || return 1
+    validate_port "${field_value}" || return 1
+    ;;
+  peerno | peertls | peerws | peerwss)
+    validate_filename_token "${field_target}" || return 1
+    [[ "${field_value}" == "round" || "${field_value}" == "random" || "${field_value}" == "fifo" ]] || return 1
+    ;;
+  cdnno | cdnws | cdnwss)
+    validate_host_port_pair "${field_target}" || return 1
+    validate_host_header "${field_value}" || return 1
+    ;;
+  esac
+}
+
+validate_rawconf_file() {
+  local source_rawconf="$1"
+  local line=""
+  [[ -s "${source_rawconf}" ]] || return 1
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    if ! validate_rawconf_line "${line}"; then
+      echo -e "${Error} 导入规则存在非法内容：${line}"
+      return 1
+    fi
+  done <"${source_rawconf}"
+}
+
 normalize_input() {
   local input="$1"
   local output=""
@@ -612,7 +765,7 @@ import_rules() {
     return 1
   }
 
-  if ! tar -xzf "${import_path}" -C "${unpack_dir}"; then
+  if ! safe_extract_bundle "${import_path}" "${unpack_dir}"; then
     rm -rf "${unpack_dir}"
     echo -e "${Error} 导入包解压失败。"
     return 1
@@ -622,6 +775,10 @@ import_rules() {
   if [[ ! -s "${imported_rawconf}" ]]; then
     rm -rf "${unpack_dir}"
     echo -e "${Error} 导入包缺少 rawconf 或规则为空。"
+    return 1
+  fi
+  if ! validate_rawconf_file "${imported_rawconf}"; then
+    rm -rf "${unpack_dir}"
     return 1
   fi
 
@@ -726,7 +883,7 @@ import_share_code() {
     echo -e "${Error} 分享码解码失败。"
     return 1
   fi
-  if ! tar -xzf "${archive_file}" -C "${unpack_dir}"; then
+  if ! safe_extract_bundle "${archive_file}" "${unpack_dir}"; then
     rm -rf "${unpack_dir}"
     echo -e "${Error} 分享码内容解压失败。"
     return 1
@@ -736,6 +893,10 @@ import_share_code() {
   if [[ ! -s "${imported_rawconf}" ]]; then
     rm -rf "${unpack_dir}"
     echo -e "${Error} 分享码缺少有效规则。"
+    return 1
+  fi
+  if ! validate_rawconf_file "${imported_rawconf}"; then
+    rm -rf "${unpack_dir}"
     return 1
   fi
 
@@ -1733,6 +1894,7 @@ cron_restart() {
 update_sh() {
   local ol_version=""
   local script_path=""
+  local temp_script=""
   script_path="${BASH_SOURCE[0]}"
   [[ "${script_path}" != /* ]] && script_path="$(pwd)/${script_path}"
   if command -v curl >/dev/null 2>&1; then
@@ -1744,13 +1906,25 @@ update_sh() {
     if [[ "$shell_version" != "$ol_version" ]]; then
       echo -e "存在新版本，是否更新 [Y/N]?"
       if ask_yes_no "" "n"; then
-        if download_file "https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh" "${script_path}"; then
-          chmod +x "${script_path}"
-          echo -e "更新完成"
-          exec bash "${script_path}"
-        else
+        temp_script=$(mktemp /tmp/gost-update.XXXXXX.sh) || {
+          echo -e "${Error} 无法创建更新临时文件。"
+          return 1
+        }
+        if ! download_file "https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh" "${temp_script}"; then
+          rm -f "${temp_script}"
           echo -e "${Error} 更新失败，请检查网络。"
+          return 1
         fi
+        if ! bash -n "${temp_script}" >/dev/null 2>&1; then
+          rm -f "${temp_script}"
+          echo -e "${Error} 下载到的新脚本语法检查失败，已取消更新。"
+          return 1
+        fi
+        chmod +x "${temp_script}"
+        mv "${temp_script}" "${script_path}"
+        chmod +x "${script_path}"
+        echo -e "更新完成"
+        exec bash "${script_path}"
       fi
     else
       echo -e "                 ${Green_font_prefix}当前版本为最新版本！${Font_color_suffix}"
