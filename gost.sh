@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.8"
+shell_version="1.1.9"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -395,7 +395,7 @@ validate_share_code_length() {
   code_length=${#share_code}
   if ((code_length > share_code_max_length)); then
     echo -e "${Error} 分享码长度为 ${code_length}，超过上限 ${share_code_max_length}。"
-    echo -e "${Info} 单条规则请优先使用分享码；多规则或均衡负载较多时建议改用规则包导入导出。"
+    echo -e "${Info} 当前分享码更适合单条或少量规则；规则较多时建议拆分为多次分享导入。"
     return 1
   fi
 }
@@ -2028,16 +2028,14 @@ show_main_menu() {
 ————————————
  ${Green_font_prefix}10.${Font_color_suffix} gost定时重启配置
  ${Green_font_prefix}11.${Font_color_suffix} 自定义TLS证书配置
- ${Green_font_prefix}12.${Font_color_suffix} 导出规则包
- ${Green_font_prefix}13.${Font_color_suffix} 导入规则包
- ${Green_font_prefix}14.${Font_color_suffix} 导出分享码
- ${Green_font_prefix}15.${Font_color_suffix} 导入分享码
+ ${Green_font_prefix}12.${Font_color_suffix} 导出分享码
+ ${Green_font_prefix}13.${Font_color_suffix} 导入分享码
 ————————————" && echo
 }
 
 handle_main_menu() {
   local num=""
-  prompt_choice " 请输入数字 [1-15]:" 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+  prompt_choice " 请输入数字 [1-13]:" 1 2 3 4 5 6 7 8 9 10 11 12 13
   num="$REPLY"
   case "$num" in
 1)
@@ -2103,19 +2101,13 @@ handle_main_menu() {
   cert
   ;;
 12)
-  export_rules
-  ;;
-13)
-  import_rules
-  ;;
-14)
   export_share_code
   ;;
-15)
+13)
   import_share_code
   ;;
 *)
-  echo "请输入正确数字 [1-15]"
+  echo "请输入正确数字 [1-13]"
   ;;
   esac
 }
