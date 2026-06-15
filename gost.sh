@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.14"
+shell_version="1.1.15"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -1640,6 +1640,537 @@ function get_rule_display_name() {
   fi
 }
 
+supports_secure_validation() {
+  case "$1" in
+  encrypttls | encryptwss | encryptquic)
+    return 0
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+get_rule_category() {
+  case "$1" in
+  nonencrypt | encrypttls | encryptws | encryptwss | encryptquic | encryptkcp)
+    printf '%s' "forward"
+    ;;
+  decrypttls | decryptws | decryptwss | decryptquic | decryptkcp)
+    printf '%s' "decrypt"
+    ;;
+  peerno | peertls | peerws | peerwss | peerquic | peerkcp)
+    printf '%s' "peer"
+    ;;
+  cdnno | cdnws | cdnwss)
+    printf '%s' "cdn"
+    ;;
+  ss | socks | http)
+    printf '%s' "proxy"
+    ;;
+  *)
+    printf '%s' "unknown"
+    ;;
+  esac
+}
+
+split_host_port_pair() {
+  local host_port="$1"
+  if [[ "${host_port}" =~ ^(\[[^][]+\]):([0-9]+)$ ]]; then
+    SPLIT_HOST="${BASH_REMATCH[1]}"
+    SPLIT_PORT="${BASH_REMATCH[2]}"
+    return 0
+  fi
+  if [[ "${host_port}" =~ ^([^:]+):([0-9]+)$ ]]; then
+    SPLIT_HOST="${BASH_REMATCH[1]}"
+    SPLIT_PORT="${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+parse_rule_for_edit() {
+  local line="$1"
+  local head=""
+  local field_target=""
+  local field_value=""
+
+  edit_rule_line="${line}"
+  head="${line%%#*}"
+  field_target="${line#*#}"
+  field_value="${field_target#*#}"
+  field_target="${field_target%%#*}"
+
+  edit_rule_type="${head%%/*}"
+  edit_source="${head#*/}"
+  edit_field_target="${field_target}"
+  edit_field_value="${field_value}"
+  edit_secure="n"
+  edit_target_host=""
+  edit_target_port=""
+  edit_peer_file=""
+  edit_strategy=""
+  edit_host_header=""
+  edit_password=""
+  edit_username=""
+  edit_listen_port=""
+  edit_cipher=""
+
+  if [[ "${edit_field_value}" == *"?secure=true" ]]; then
+    edit_field_value="${edit_field_value%\?secure=true}"
+    edit_secure="y"
+  fi
+
+  case "${edit_rule_type}" in
+  nonencrypt | encrypttls | encryptws | encryptwss | encryptquic | encryptkcp | decrypttls | decryptws | decryptwss | decryptquic | decryptkcp)
+    edit_target_host="${edit_field_target}"
+    edit_target_port="${edit_field_value}"
+    ;;
+  peerno | peertls | peerws | peerwss | peerquic | peerkcp)
+    edit_peer_file="${edit_field_target}"
+    edit_strategy="${edit_field_value}"
+    ;;
+  cdnno | cdnws | cdnwss)
+    split_host_port_pair "${edit_field_target}" || return 1
+    edit_target_host="${SPLIT_HOST}"
+    edit_target_port="${SPLIT_PORT}"
+    edit_host_header="${edit_field_value}"
+    ;;
+  ss)
+    edit_password="${edit_source}"
+    edit_cipher="${edit_field_target}"
+    edit_listen_port="${edit_field_value}"
+    ;;
+  socks | http)
+    edit_password="${edit_source}"
+    edit_username="${edit_field_target}"
+    edit_listen_port="${edit_field_value}"
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+build_rule_from_edit_state() {
+  local value_part=""
+  case "${edit_rule_type}" in
+  nonencrypt | encrypttls | encryptws | encryptwss | encryptquic | encryptkcp | decrypttls | decryptws | decryptwss | decryptquic | decryptkcp)
+    value_part="${edit_target_port}"
+    if supports_secure_validation "${edit_rule_type}" && [[ "${edit_secure}" == "y" ]]; then
+      value_part="${value_part}?secure=true"
+    fi
+    printf '%s' "${edit_rule_type}/${edit_source}#${edit_target_host}#${value_part}"
+    ;;
+  peerno | peertls | peerws | peerwss | peerquic | peerkcp)
+    printf '%s' "${edit_rule_type}/${edit_source}#${edit_peer_file}#${edit_strategy}"
+    ;;
+  cdnno | cdnws | cdnwss)
+    printf '%s' "${edit_rule_type}/${edit_source}#${edit_target_host}:${edit_target_port}#${edit_host_header}"
+    ;;
+  ss)
+    printf '%s' "ss/${edit_password}#${edit_cipher}#${edit_listen_port}"
+    ;;
+  socks | http)
+    printf '%s' "${edit_rule_type}/${edit_password}#${edit_username}#${edit_listen_port}"
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+prompt_rule_source_port_update() {
+  echo -e "当前本地端口: ${edit_source}"
+  prompt_nonempty "请输入新的本地端口: " validate_port "请输入合法端口（1-65535）"
+  edit_source="$REPLY"
+}
+
+prompt_rule_target_host_update() {
+  echo -e "当前目标地址: ${edit_target_host}"
+  if supports_secure_validation "${edit_rule_type}" && [[ "${edit_secure}" == "y" ]]; then
+    prompt_nonempty "请输入新的目标域名: " validate_host_header "请输入合法域名"
+    edit_target_host="$REPLY"
+  else
+    prompt_nonempty "请输入新的目标地址: " validate_host "请输入合法的 IP 或域名"
+    edit_target_host=$(normalize_host "$REPLY")
+  fi
+}
+
+prompt_rule_target_port_update() {
+  echo -e "当前目标端口: ${edit_target_port}"
+  prompt_nonempty "请输入新的目标端口: " validate_port "请输入合法端口（1-65535）"
+  edit_target_port="$REPLY"
+}
+
+prompt_rule_strategy_update() {
+  echo -e "当前负载策略: ${edit_strategy}"
+  echo -e "[1] round - 轮询"
+  echo -e "[2] random - 随机"
+  echo -e "[3] fifo - 自上而下"
+  prompt_choice "请选择新的负载策略: " 1 2 3
+  case "$REPLY" in
+  1) edit_strategy="round" ;;
+  2) edit_strategy="random" ;;
+  3) edit_strategy="fifo" ;;
+  esac
+}
+
+prompt_rule_cipher_update() {
+  echo -e "当前 ss 加密方式: ${edit_cipher}"
+  echo -e "[1] aes-256-gcm"
+  echo -e "[2] aes-256-cfb"
+  echo -e "[3] chacha20-ietf-poly1305"
+  echo -e "[4] chacha20"
+  echo -e "[5] rc4-md5"
+  echo -e "[6] AEAD_CHACHA20_POLY1305"
+  prompt_choice "请选择新的 ss 加密方式: " 1 2 3 4 5 6
+  case "$REPLY" in
+  1) edit_cipher="aes-256-gcm" ;;
+  2) edit_cipher="aes-256-cfb" ;;
+  3) edit_cipher="chacha20-ietf-poly1305" ;;
+  4) edit_cipher="chacha20" ;;
+  5) edit_cipher="rc4-md5" ;;
+  6) edit_cipher="AEAD_CHACHA20_POLY1305" ;;
+  esac
+}
+
+prompt_rule_proxy_type_update() {
+  local current_type="${edit_rule_type}"
+  echo -e "当前代理类型: ${current_type}"
+  echo -e "[1] shadowsocks"
+  echo -e "[2] socks5"
+  echo -e "[3] http"
+  prompt_choice "请选择新的代理类型: " 1 2 3
+  case "$REPLY" in
+  1)
+    edit_rule_type="ss"
+    if [[ "${current_type}" != "ss" ]]; then
+      prompt_rule_cipher_update
+    fi
+    ;;
+  2)
+    edit_rule_type="socks"
+    if [[ "${current_type}" == "ss" ]]; then
+      prompt_nonempty "请输入新的 socks 用户名: " validate_no_space_or_delimiter "用户名不能为空，且不能包含空格或 #"
+      edit_username="$REPLY"
+    fi
+    ;;
+  3)
+    edit_rule_type="http"
+    if [[ "${current_type}" == "ss" ]]; then
+      prompt_nonempty "请输入新的 http 用户名: " validate_no_space_or_delimiter "用户名不能为空，且不能包含空格或 #"
+      edit_username="$REPLY"
+    fi
+    ;;
+  esac
+}
+
+prompt_rule_transport_update() {
+  local current_type="${edit_rule_type}"
+  local category=""
+  category="$(get_rule_category "${edit_rule_type}")"
+
+  case "${category}" in
+  forward)
+    echo -e "当前传输类型: ${current_type}"
+    echo -e "[1] 不加密中转"
+    echo -e "[2] tls隧道"
+    echo -e "[3] ws隧道"
+    echo -e "[4] wss隧道"
+    echo -e "[5] quic隧道"
+    echo -e "[6] kcp隧道"
+    prompt_choice "请选择新的传输类型: " 1 2 3 4 5 6
+    case "$REPLY" in
+    1) edit_rule_type="nonencrypt" ;;
+    2) edit_rule_type="encrypttls" ;;
+    3) edit_rule_type="encryptws" ;;
+    4) edit_rule_type="encryptwss" ;;
+    5) edit_rule_type="encryptquic" ;;
+    6) edit_rule_type="encryptkcp" ;;
+    esac
+    ;;
+  decrypt)
+    echo -e "当前解密类型: ${current_type}"
+    echo -e "[1] tls"
+    echo -e "[2] ws"
+    echo -e "[3] wss"
+    echo -e "[4] quic"
+    echo -e "[5] kcp"
+    prompt_choice "请选择新的解密类型: " 1 2 3 4 5
+    case "$REPLY" in
+    1) edit_rule_type="decrypttls" ;;
+    2) edit_rule_type="decryptws" ;;
+    3) edit_rule_type="decryptwss" ;;
+    4) edit_rule_type="decryptquic" ;;
+    5) edit_rule_type="decryptkcp" ;;
+    esac
+    edit_secure="n"
+    ;;
+  peer)
+    echo -e "当前负载传输类型: ${current_type}"
+    echo -e "[1] 不加密转发"
+    echo -e "[2] tls隧道"
+    echo -e "[3] ws隧道"
+    echo -e "[4] wss隧道"
+    echo -e "[5] quic隧道"
+    echo -e "[6] kcp隧道"
+    prompt_choice "请选择新的负载传输类型: " 1 2 3 4 5 6
+    case "$REPLY" in
+    1) edit_rule_type="peerno" ;;
+    2) edit_rule_type="peertls" ;;
+    3) edit_rule_type="peerws" ;;
+    4) edit_rule_type="peerwss" ;;
+    5) edit_rule_type="peerquic" ;;
+    6) edit_rule_type="peerkcp" ;;
+    esac
+    edit_secure="n"
+    ;;
+  cdn)
+    echo -e "当前 CDN 传输类型: ${current_type}"
+    echo -e "[1] 不加密转发"
+    echo -e "[2] ws隧道"
+    echo -e "[3] wss隧道"
+    prompt_choice "请选择新的 CDN 传输类型: " 1 2 3
+    case "$REPLY" in
+    1) edit_rule_type="cdnno" ;;
+    2) edit_rule_type="cdnws" ;;
+    3) edit_rule_type="cdnwss" ;;
+    esac
+    edit_secure="n"
+    ;;
+  proxy)
+    prompt_rule_proxy_type_update
+    return 0
+    ;;
+  *)
+    echo -e "${Error} 当前规则类型暂不支持修改协议。"
+    return 1
+    ;;
+  esac
+
+  if supports_secure_validation "${edit_rule_type}"; then
+    local default_secure="n"
+    if supports_secure_validation "${current_type}" && [[ "${edit_secure}" == "y" ]]; then
+      default_secure="y"
+    fi
+    if ask_yes_no "是否校验落地自定义证书？[y/N]:" "${default_secure}"; then
+      edit_secure="y"
+      if ! validate_host_header "${edit_target_host}"; then
+        echo -e "开启证书校验时，目标地址必须是域名。"
+        prompt_nonempty "请输入新的目标域名: " validate_host_header "请输入合法域名"
+        edit_target_host="$REPLY"
+      fi
+    else
+      edit_secure="n"
+    fi
+  else
+    edit_secure="n"
+  fi
+}
+
+rename_peer_file_reference() {
+  local old_name="$1"
+  local new_name="$2"
+  local old_path="/root/${old_name}.txt"
+  local new_path="/root/${new_name}.txt"
+
+  [[ "${old_name}" == "${new_name}" ]] && return 0
+  if [[ -e "${new_path}" ]]; then
+    echo -e "${Error} 目标落地列表文件已存在：${new_path}"
+    return 1
+  fi
+  if [[ -e "${old_path}" ]]; then
+    mv "${old_path}" "${new_path}"
+  fi
+  return 0
+}
+
+modify_conf() {
+  local numedit=""
+  local count_line=0
+  local selected_rule=""
+  local edited_rule=""
+  local tmp_rawconf=""
+  local category=""
+  local old_peer_file=""
+
+  check_root
+  ensure_raw_conf_file
+  if ! is_gost_installed; then
+    echo -e "${Error} gost 尚未安装，请先安装。"
+    return 1
+  fi
+
+  show_all_conf
+  if [[ ! -s "$raw_conf_path" ]]; then
+    return 0
+  fi
+
+  count_line=$(awk 'END{print NR}' "$raw_conf_path")
+  while true; do
+    prompt_nonempty "请输入你要修改的配置编号：" validate_menu_number "请输入正确数字"
+    numedit="$REPLY"
+    if ((10#$numedit >= 1 && 10#$numedit <= count_line)); then
+      break
+    fi
+    echo "编号超出范围，请输入 1-${count_line}"
+  done
+
+  selected_rule=$(sed -n "${numedit}p" "$raw_conf_path")
+  if ! parse_rule_for_edit "${selected_rule}"; then
+    echo -e "${Error} 规则解析失败，暂不支持修改该规则。"
+    return 1
+  fi
+
+  category="$(get_rule_category "${edit_rule_type}")"
+  old_peer_file="${edit_peer_file}"
+
+  echo -e "当前选中第 ${numedit} 条规则。"
+  case "${category}" in
+  forward | decrypt)
+    echo -e "[1] 修改本地端口"
+    echo -e "[2] 修改目标地址"
+    echo -e "[3] 修改目标端口"
+    echo -e "[4] 修改协议类型"
+    prompt_choice "请选择: " 1 2 3 4
+    case "$REPLY" in
+    1) prompt_rule_source_port_update ;;
+    2) prompt_rule_target_host_update ;;
+    3) prompt_rule_target_port_update ;;
+    4) prompt_rule_transport_update ;;
+    esac
+    ;;
+  peer)
+    echo -e "[1] 修改本地端口"
+    echo -e "[2] 修改落地列表文件名"
+    echo -e "[3] 修改负载策略"
+    echo -e "[4] 修改协议类型"
+    prompt_choice "请选择: " 1 2 3 4
+    case "$REPLY" in
+    1) prompt_rule_source_port_update ;;
+    2)
+      echo -e "当前落地列表文件名: ${edit_peer_file}"
+      prompt_nonempty "请输入新的落地列表文件名（不含 .txt）: " validate_filename_token "文件名只能包含字母、数字、点、下划线或中划线"
+      edit_peer_file="$REPLY"
+      if ! rename_peer_file_reference "${old_peer_file}" "${edit_peer_file}"; then
+        return 1
+      fi
+      ;;
+    3) prompt_rule_strategy_update ;;
+    4) prompt_rule_transport_update ;;
+    esac
+    ;;
+  cdn)
+    echo -e "[1] 修改本地端口"
+    echo -e "[2] 修改自选节点地址"
+    echo -e "[3] 修改自选节点端口"
+    echo -e "[4] 修改 Host"
+    echo -e "[5] 修改协议类型"
+    prompt_choice "请选择: " 1 2 3 4 5
+    case "$REPLY" in
+    1) prompt_rule_source_port_update ;;
+    2)
+      echo -e "当前自选节点地址: ${edit_target_host}"
+      prompt_nonempty "请输入新的自选节点地址: " validate_host "请输入合法的 IP 或域名"
+      edit_target_host=$(normalize_host "$REPLY")
+      ;;
+    3) prompt_rule_target_port_update ;;
+    4)
+      echo -e "当前 Host: ${edit_host_header}"
+      prompt_nonempty "请输入新的 Host: " validate_host_header "请输入合法 Host"
+      edit_host_header="$REPLY"
+      ;;
+    5) prompt_rule_transport_update ;;
+    esac
+    ;;
+  proxy)
+    if [[ "${edit_rule_type}" == "ss" ]]; then
+      echo -e "[1] 修改密码"
+      echo -e "[2] 修改加密方式"
+      echo -e "[3] 修改监听端口"
+      echo -e "[4] 修改代理类型"
+      prompt_choice "请选择: " 1 2 3 4
+      case "$REPLY" in
+      1)
+        echo -e "当前密码: ${edit_password}"
+        prompt_nonempty "请输入新的密码: " validate_no_space_or_delimiter "密码不能为空，且不能包含空格或 #"
+        edit_password="$REPLY"
+        ;;
+      2) prompt_rule_cipher_update ;;
+      3)
+        echo -e "当前监听端口: ${edit_listen_port}"
+        prompt_nonempty "请输入新的监听端口: " validate_port "请输入合法端口（1-65535）"
+        edit_listen_port="$REPLY"
+        ;;
+      4) prompt_rule_proxy_type_update ;;
+      esac
+    else
+      echo -e "[1] 修改密码"
+      echo -e "[2] 修改用户名"
+      echo -e "[3] 修改监听端口"
+      echo -e "[4] 修改代理类型"
+      prompt_choice "请选择: " 1 2 3 4
+      case "$REPLY" in
+      1)
+        echo -e "当前密码: ${edit_password}"
+        prompt_nonempty "请输入新的密码: " validate_no_space_or_delimiter "密码不能为空，且不能包含空格或 #"
+        edit_password="$REPLY"
+        ;;
+      2)
+        echo -e "当前用户名: ${edit_username}"
+        prompt_nonempty "请输入新的用户名: " validate_no_space_or_delimiter "用户名不能为空，且不能包含空格或 #"
+        edit_username="$REPLY"
+        ;;
+      3)
+        echo -e "当前监听端口: ${edit_listen_port}"
+        prompt_nonempty "请输入新的监听端口: " validate_port "请输入合法端口（1-65535）"
+        edit_listen_port="$REPLY"
+        ;;
+      4) prompt_rule_proxy_type_update ;;
+      esac
+    fi
+    ;;
+  *)
+    echo -e "${Error} 当前规则类型暂不支持修改。"
+    return 1
+    ;;
+  esac
+
+  edited_rule=$(build_rule_from_edit_state) || {
+    echo -e "${Error} 修改后的规则构建失败。"
+    return 1
+  }
+
+  if ! validate_rawconf_line "${edited_rule}"; then
+    echo -e "${Error} 修改后的规则校验失败，已取消。"
+    return 1
+  fi
+
+  tmp_rawconf=$(make_temp_file "gost-rawconf-edit" "") || {
+    echo -e "${Error} 无法创建规则替换临时文件。"
+    return 1
+  }
+
+  awk -v line_no="${numedit}" -v replacement="${edited_rule}" '
+    NR == line_no { print replacement; next }
+    { print }
+  ' "$raw_conf_path" >"${tmp_rawconf}"
+
+  if ! validate_rawconf_file "${tmp_rawconf}"; then
+    rm -f "${tmp_rawconf}"
+    echo -e "${Error} 修改后的完整配置校验失败，已取消。"
+    return 1
+  fi
+
+  mv "${tmp_rawconf}" "$raw_conf_path"
+  if apply_runtime_config; then
+    echo -e "配置已修改，当前配置如下"
+    echo -e "--------------------------------------------------------"
+    show_all_conf
+  fi
+}
+
 show_rawconf_preview() {
   local source_rawconf="$1"
   local title="$2"
@@ -2314,6 +2845,7 @@ show_main_menu() {
  ${Green_font_prefix}7.${Font_color_suffix} 新增gost转发配置
  ${Green_font_prefix}8.${Font_color_suffix} 查看现有gost配置
  ${Green_font_prefix}9.${Font_color_suffix} 删除一则gost配置
+ ${Green_font_prefix}14.${Font_color_suffix} 修改一则gost配置
 ————————————
  ${Green_font_prefix}10.${Font_color_suffix} gost定时重启配置
  ${Green_font_prefix}11.${Font_color_suffix} 自定义TLS证书配置
@@ -2324,7 +2856,7 @@ show_main_menu() {
 
 handle_main_menu() {
   local num=""
-  prompt_choice " 请输入数字 [1-13]:" 1 2 3 4 5 6 7 8 9 10 11 12 13
+  prompt_choice " 请输入数字 [1-14]:" 1 2 3 4 5 6 7 8 9 10 11 12 13 14
   num="$REPLY"
   case "$num" in
 1)
@@ -2395,8 +2927,11 @@ handle_main_menu() {
 13)
   import_share_code
   ;;
+14)
+  modify_conf
+  ;;
 *)
-  echo "请输入正确数字 [1-13]"
+  echo "请输入正确数字 [1-14]"
   ;;
   esac
   pause_before_menu
