@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.10"
+shell_version="1.1.11"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -309,10 +309,10 @@ validate_rawconf_line() {
   source_value="${head#*/}"
 
   case "${rule_type}" in
-  nonencrypt | encrypttls | encryptws | encryptwss | decrypttls | decryptws | decryptwss)
+  nonencrypt | encrypttls | encryptws | encryptwss | encryptquic | encryptkcp | decrypttls | decryptws | decryptwss | decryptquic | decryptkcp)
     validate_port "${source_value}" || return 1
     ;;
-  peerno | peertls | peerws | peerwss | cdnno | cdnws | cdnwss)
+  peerno | peertls | peerws | peerwss | peerquic | peerkcp | cdnno | cdnws | cdnwss)
     validate_port "${source_value}" || return 1
     ;;
   ss | socks | http)
@@ -324,7 +324,7 @@ validate_rawconf_line() {
   esac
 
   case "${rule_type}" in
-  nonencrypt | encrypttls | encryptws | encryptwss | decrypttls | decryptws | decryptwss)
+  nonencrypt | encrypttls | encryptws | encryptwss | encryptquic | encryptkcp | decrypttls | decryptws | decryptwss | decryptquic | decryptkcp)
     validate_host "${field_target}" || validate_host_header "${field_target}" || return 1
     [[ "${field_value}" == *"?secure=true" ]] && field_value="${field_value%\?secure=true}"
     validate_port "${field_value}" || return 1
@@ -339,7 +339,7 @@ validate_rawconf_line() {
     validate_no_space_or_delimiter "${field_target}" || return 1
     validate_port "${field_value}" || return 1
     ;;
-  peerno | peertls | peerws | peerwss)
+  peerno | peertls | peerws | peerwss | peerquic | peerkcp)
     validate_filename_token "${field_target}" || return 1
     [[ "${field_value}" == "round" || "${field_value}" == "random" || "${field_value}" == "fifo" ]] || return 1
     ;;
@@ -627,8 +627,13 @@ build_selected_rawconf() {
   fi
 
   while true; do
-    prompt_nonempty "请输入要导出的规则编号，支持 1,3,5-7: " "" "请输入规则编号"
-    selected_expr="${REPLY// /}"
+    read -r -p "请输入要导出的规则编号，支持 1,3,5-7；直接回车导出全部: " selected_expr
+    selected_expr=$(normalize_input "${selected_expr}")
+    selected_expr="${selected_expr// /}"
+    if [[ -z "${selected_expr}" ]]; then
+      cp "$raw_conf_path" "${output_rawconf}"
+      break
+    fi
     if [[ ! "${selected_expr}" =~ ^[0-9,-]+$ ]]; then
       echo "格式不正确，请使用 1,3,5-7 这种形式。"
       continue
@@ -1449,6 +1454,11 @@ function writerawconf() {
   echo "${flag_a}/${flag_b}#${flag_c}#${flag_d}" >>"$raw_conf_path"
 }
 function rawconf() {
+  flag_a=""
+  flag_b=""
+  flag_c=""
+  flag_d=""
+  is_cert="n"
   read_protocol
   read_s_port
   read_d_ip
@@ -1472,6 +1482,10 @@ function get_rule_display_name() {
     str="  ws隧道 "
   elif [ "$is_encrypt" == "encryptwss" ]; then
     str=" wss隧道 "
+  elif [ "$is_encrypt" == "encryptquic" ]; then
+    str="quic隧道 "
+  elif [ "$is_encrypt" == "encryptkcp" ]; then
+    str=" kcp隧道 "
   elif [ "$is_encrypt" == "peerno" ]; then
     str=" 不加密均衡负载 "
   elif [ "$is_encrypt" == "peertls" ]; then
@@ -1480,12 +1494,20 @@ function get_rule_display_name() {
     str="  ws隧道均衡负载 "
   elif [ "$is_encrypt" == "peerwss" ]; then
     str=" wss隧道均衡负载 "
+  elif [ "$is_encrypt" == "peerquic" ]; then
+    str="quic隧道均衡负载"
+  elif [ "$is_encrypt" == "peerkcp" ]; then
+    str=" kcp隧道均衡负载"
   elif [ "$is_encrypt" == "decrypttls" ]; then
     str=" tls解密 "
   elif [ "$is_encrypt" == "decryptws" ]; then
     str="  ws解密 "
   elif [ "$is_encrypt" == "decryptwss" ]; then
     str=" wss解密 "
+  elif [ "$is_encrypt" == "decryptquic" ]; then
+    str="quic解密 "
+  elif [ "$is_encrypt" == "decryptkcp" ]; then
+    str=" kcp解密 "
   elif [ "$is_encrypt" == "ss" ]; then
     str="   ss   "
   elif [ "$is_encrypt" == "socks" ]; then
@@ -1584,9 +1606,12 @@ function encrypt() {
   echo -e "[1] tls隧道"
   echo -e "[2] ws隧道"
   echo -e "[3] wss隧道"
+  echo -e "[4] quic隧道"
+  echo -e "[5] kcp隧道"
   echo -e "注意: 同一则转发，中转与落地传输类型必须对应！本脚本默认开启tcp+udp"
+  echo -e "提示: quic/kcp 依赖 UDP，请同时放行对应端口的 UDP 入站"
   echo -e "-----------------------------------"
-  prompt_choice "请选择转发传输类型: " 1 2 3
+  prompt_choice "请选择转发传输类型: " 1 2 3 4 5
   numencrypt="$REPLY"
 
   if [ "$numencrypt" == "1" ]; then
@@ -1607,6 +1632,16 @@ function encrypt() {
     else
       is_cert="n"
     fi
+  elif [ "$numencrypt" == "4" ]; then
+    flag_a="encryptquic"
+    echo -e "注意: 选择 是 将针对落地的自定义证书开启证书校验保证安全性，稍后落地机务必填写${Red_font_prefix}域名${Font_color_suffix}"
+    if ask_yes_no "落地机是否开启了自定义tls证书？[y/N]:" "n"; then
+      is_cert="y"
+    else
+      is_cert="n"
+    fi
+  elif [ "$numencrypt" == "5" ]; then
+    flag_a="encryptkcp"
   fi
 }
 function enpeer() {
@@ -1616,11 +1651,14 @@ function enpeer() {
   echo -e "[2] tls隧道"
   echo -e "[3] ws隧道"
   echo -e "[4] wss隧道"
+  echo -e "[5] quic隧道"
+  echo -e "[6] kcp隧道"
   echo -e "注意: 同一则转发，中转与落地传输类型必须对应！本脚本默认同一配置的传输类型相同"
+  echo -e "提示: quic/kcp 依赖 UDP，请同时放行对应端口的 UDP 入站"
   echo -e "此脚本仅支持简单型均衡负载，具体可参考官方文档"
   echo -e "gost均衡负载官方文档：https://docs.ginuerzh.xyz/gost/load-balancing"
   echo -e "-----------------------------------"
-  prompt_choice "请选择转发传输类型: " 1 2 3 4
+  prompt_choice "请选择转发传输类型: " 1 2 3 4 5 6
   numpeer="$REPLY"
 
   if [ "$numpeer" == "1" ]; then
@@ -1631,6 +1669,10 @@ function enpeer() {
     flag_a="peerws"
   elif [ "$numpeer" == "4" ]; then
     flag_a="peerwss"
+  elif [ "$numpeer" == "5" ]; then
+    flag_a="peerquic"
+  elif [ "$numpeer" == "6" ]; then
+    flag_a="peerkcp"
   fi
 }
 function cdn() {
@@ -1742,9 +1784,12 @@ function decrypt() {
   echo -e "[1] tls"
   echo -e "[2] ws"
   echo -e "[3] wss"
+  echo -e "[4] quic"
+  echo -e "[5] kcp"
   echo -e "注意: 同一则转发，中转与落地传输类型必须对应！本脚本默认开启tcp+udp"
+  echo -e "提示: quic/kcp 依赖 UDP，请同时放行对应端口的 UDP 入站"
   echo -e "-----------------------------------"
-  prompt_choice "请选择解密传输类型: " 1 2 3
+  prompt_choice "请选择解密传输类型: " 1 2 3 4 5
   numdecrypt="$REPLY"
 
   if [ "$numdecrypt" == "1" ]; then
@@ -1753,6 +1798,10 @@ function decrypt() {
     flag_a="decryptws"
   elif [ "$numdecrypt" == "3" ]; then
     flag_a="decryptwss"
+  elif [ "$numdecrypt" == "4" ]; then
+    flag_a="decryptquic"
+  elif [ "$numdecrypt" == "5" ]; then
+    flag_a="decryptkcp"
   fi
 }
 function proxy() {
@@ -1802,6 +1851,18 @@ function method() {
 	],
 	\"ChainNodes\": [
 		\"relay+wss://$d_ip:$d_port\"" >>$gost_conf_path
+    elif [ "$is_encrypt" == "encryptquic" ]; then
+      echo "        \"tcp://:$s_port\",
+        \"udp://:$s_port\"
+    ],
+    \"ChainNodes\": [
+        \"relay+quic://$d_ip:$d_port\"" >>$gost_conf_path
+    elif [ "$is_encrypt" == "encryptkcp" ]; then
+      echo "        \"tcp://:$s_port\",
+        \"udp://:$s_port\"
+    ],
+    \"ChainNodes\": [
+        \"relay+kcp://$d_ip:$d_port\"" >>$gost_conf_path
     elif [ "$is_encrypt" == "peertls" ]; then
       echo "        \"tcp://:$s_port\",
     	\"udp://:$s_port\"
@@ -1820,6 +1881,18 @@ function method() {
 	],
 	\"ChainNodes\": [
     	\"relay+wss://:?ip=/root/$d_ip.txt&strategy=$d_port\"" >>$gost_conf_path
+    elif [ "$is_encrypt" == "peerquic" ]; then
+      echo "        \"tcp://:$s_port\",
+        \"udp://:$s_port\"
+    ],
+    \"ChainNodes\": [
+        \"relay+quic://:?ip=/root/$d_ip.txt&strategy=$d_port\"" >>$gost_conf_path
+    elif [ "$is_encrypt" == "peerkcp" ]; then
+      echo "        \"tcp://:$s_port\",
+        \"udp://:$s_port\"
+    ],
+    \"ChainNodes\": [
+        \"relay+kcp://:?ip=/root/$d_ip.txt&strategy=$d_port\"" >>$gost_conf_path
     elif [ "$is_encrypt" == "cdnws" ]; then
       echo "        \"tcp://:$s_port\",
     	\"udp://:$s_port\"
@@ -1846,6 +1919,14 @@ function method() {
       else
         echo "        \"relay+wss://:$s_port/$d_ip:$d_port\"" >>$gost_conf_path
       fi
+    elif [ "$is_encrypt" == "decryptquic" ]; then
+      if [ -d "$HOME/gost_cert" ]; then
+        echo "        \"relay+quic://:$s_port/$d_ip:$d_port?cert=/root/gost_cert/cert.pem&key=/root/gost_cert/key.pem\"" >>$gost_conf_path
+      else
+        echo "        \"relay+quic://:$s_port/$d_ip:$d_port\"" >>$gost_conf_path
+      fi
+    elif [ "$is_encrypt" == "decryptkcp" ]; then
+      echo "        \"relay+kcp://:$s_port/$d_ip:$d_port\"" >>$gost_conf_path
     elif [ "$is_encrypt" == "ss" ]; then
       echo "        \"ss://$d_ip:$s_port@:$d_port\"" >>$gost_conf_path
     elif [ "$is_encrypt" == "socks" ]; then
@@ -1883,6 +1964,18 @@ function method() {
 		    ],
 		    \"ChainNodes\": [
 		        \"relay+wss://$d_ip:$d_port\"" >>$gost_conf_path
+    elif [ "$is_encrypt" == "encryptquic" ]; then
+      echo "                \"tcp://:$s_port\",
+                \"udp://:$s_port\"
+            ],
+            \"ChainNodes\": [
+                \"relay+quic://$d_ip:$d_port\"" >>$gost_conf_path
+    elif [ "$is_encrypt" == "encryptkcp" ]; then
+      echo "                \"tcp://:$s_port\",
+                \"udp://:$s_port\"
+            ],
+            \"ChainNodes\": [
+                \"relay+kcp://$d_ip:$d_port\"" >>$gost_conf_path
     elif [ "$is_encrypt" == "peertls" ]; then
       echo "                \"tcp://:$s_port\",
                 \"udp://:$s_port\"
@@ -1901,6 +1994,18 @@ function method() {
             ],
             \"ChainNodes\": [
                 \"relay+wss://:?ip=/root/$d_ip.txt&strategy=$d_port\"" >>$gost_conf_path
+    elif [ "$is_encrypt" == "peerquic" ]; then
+      echo "                \"tcp://:$s_port\",
+                \"udp://:$s_port\"
+            ],
+            \"ChainNodes\": [
+                \"relay+quic://:?ip=/root/$d_ip.txt&strategy=$d_port\"" >>$gost_conf_path
+    elif [ "$is_encrypt" == "peerkcp" ]; then
+      echo "                \"tcp://:$s_port\",
+                \"udp://:$s_port\"
+            ],
+            \"ChainNodes\": [
+                \"relay+kcp://:?ip=/root/$d_ip.txt&strategy=$d_port\"" >>$gost_conf_path
     elif [ "$is_encrypt" == "cdnws" ]; then
       echo "                \"tcp://:$s_port\",
                 \"udp://:$s_port\"
@@ -1927,6 +2032,14 @@ function method() {
       else
         echo "        		  \"relay+wss://:$s_port/$d_ip:$d_port\"" >>$gost_conf_path
       fi
+    elif [ "$is_encrypt" == "decryptquic" ]; then
+      if [ -d "$HOME/gost_cert" ]; then
+        echo "                  \"relay+quic://:$s_port/$d_ip:$d_port?cert=/root/gost_cert/cert.pem&key=/root/gost_cert/key.pem\"" >>$gost_conf_path
+      else
+        echo "                  \"relay+quic://:$s_port/$d_ip:$d_port\"" >>$gost_conf_path
+      fi
+    elif [ "$is_encrypt" == "decryptkcp" ]; then
+      echo "                  \"relay+kcp://:$s_port/$d_ip:$d_port\"" >>$gost_conf_path
     elif [ "$is_encrypt" == "ss" ]; then
       echo "        \"ss://$d_ip:$s_port@:$d_port\"" >>$gost_conf_path
     elif [ "$is_encrypt" == "socks" ]; then
