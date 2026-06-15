@@ -431,7 +431,7 @@ read_prompt_line() {
   local answer=""
 
   if [[ -t 0 && -t 1 ]]; then
-    if read -e -r -p "$prompt" answer 2>/dev/null; then
+    if read -e -r -p "$prompt" answer; then
       REPLY="${answer}"
       return 0
     fi
