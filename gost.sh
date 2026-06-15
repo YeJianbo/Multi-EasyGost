@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.9"
+shell_version="1.1.10"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -1975,30 +1975,26 @@ update_sh() {
   fi
   if [ -n "$ol_version" ]; then
     if [[ "$shell_version" != "$ol_version" ]]; then
-      echo -e "存在新版本，是否更新 [Y/N]?"
-      if ask_yes_no "" "n"; then
-        temp_script=$(mktemp /tmp/gost-update.XXXXXX.sh) || {
-          echo -e "${Error} 无法创建更新临时文件。"
-          return 1
-        }
-        if ! download_file "https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh" "${temp_script}"; then
-          rm -f "${temp_script}"
-          echo -e "${Error} 更新失败，请检查网络。"
-          return 1
-        fi
-        if ! bash -n "${temp_script}" >/dev/null 2>&1; then
-          rm -f "${temp_script}"
-          echo -e "${Error} 下载到的新脚本语法检查失败，已取消更新。"
-          return 1
-        fi
-        chmod +x "${temp_script}"
-        mv "${temp_script}" "${script_path}"
-        chmod +x "${script_path}"
-        echo -e "更新完成"
-        exec bash "${script_path}"
+      echo -e "${Info} 检测到新版本，正在自动更新脚本..."
+      temp_script=$(mktemp /tmp/gost-update.XXXXXX.sh) || {
+        echo -e "${Error} 无法创建更新临时文件。"
+        return 1
+      }
+      if ! download_file "https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh" "${temp_script}"; then
+        rm -f "${temp_script}"
+        echo -e "${Error} 自动更新失败，请检查网络。"
+        return 1
       fi
-    else
-      echo -e "                 ${Green_font_prefix}当前版本为最新版本！${Font_color_suffix}"
+      if ! bash -n "${temp_script}" >/dev/null 2>&1; then
+        rm -f "${temp_script}"
+        echo -e "${Error} 下载到的新脚本语法检查失败，已取消自动更新。"
+        return 1
+      fi
+      chmod +x "${temp_script}"
+      mv "${temp_script}" "${script_path}"
+      chmod +x "${script_path}"
+      echo -e "${Info} 脚本已自动更新，正在重载。"
+      exec bash "${script_path}"
     fi
   else
     echo -e "                 ${Red_font_prefix}脚本最新版本获取失败，请检查与 GitHub 的连接！${Font_color_suffix}"
