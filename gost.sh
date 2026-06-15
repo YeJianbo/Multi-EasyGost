@@ -1732,6 +1732,9 @@ cron_restart() {
 
 update_sh() {
   local ol_version=""
+  local script_path=""
+  script_path="${BASH_SOURCE[0]}"
+  [[ "${script_path}" != /* ]] && script_path="$(pwd)/${script_path}"
   if command -v curl >/dev/null 2>&1; then
     ol_version=$(curl -L -s --connect-timeout 5 https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh | grep "shell_version=" | head -1 | awk -F '=|"' '{print $3}')
   elif command -v wget >/dev/null 2>&1; then
@@ -1741,10 +1744,10 @@ update_sh() {
     if [[ "$shell_version" != "$ol_version" ]]; then
       echo -e "存在新版本，是否更新 [Y/N]?"
       if ask_yes_no "" "n"; then
-        if download_file "https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh" "$(pwd)/gost.sh"; then
-          chmod +x "$(pwd)/gost.sh"
+        if download_file "https://raw.githubusercontent.com/YeJianbo/Multi-EasyGost/v2/gost.sh" "${script_path}"; then
+          chmod +x "${script_path}"
           echo -e "更新完成"
-          exit 0
+          exec bash "${script_path}"
         else
           echo -e "${Error} 更新失败，请检查网络。"
         fi
@@ -1757,8 +1760,8 @@ update_sh() {
   fi
 }
 
-update_sh
-echo && echo -e "                 gost 一键安装配置脚本"${Red_font_prefix}[${shell_version}]${Font_color_suffix}"
+show_main_menu() {
+  echo && echo -e "                 gost 一键安装配置脚本"${Red_font_prefix}[${shell_version}]${Font_color_suffix}"
   ----------- YeJianbo -----------
   特性: (1)本脚本采用systemd及gost配置文件对gost进行管理
         (2)能够在不借助其他工具(如screen)的情况下实现多条转发规则同时生效
@@ -1785,9 +1788,13 @@ echo && echo -e "                 gost 一键安装配置脚本"${Red_font_prefi
  ${Green_font_prefix}14.${Font_color_suffix} 导出分享码
  ${Green_font_prefix}15.${Font_color_suffix} 导入分享码
 ————————————" && echo
-prompt_choice " 请输入数字 [1-15]:" 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
-num="$REPLY"
-case "$num" in
+}
+
+handle_main_menu() {
+  local num=""
+  prompt_choice " 请输入数字 [1-15]:" 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+  num="$REPLY"
+  case "$num" in
 1)
   Install_ct
   ;;
@@ -1809,7 +1816,7 @@ case "$num" in
 7)
   if ! is_gost_installed; then
     echo -e "${Error} gost 尚未安装，请先安装。"
-    exit 1
+    return 0
   fi
   rawconf
   if apply_runtime_config; then
@@ -1824,11 +1831,11 @@ case "$num" in
 9)
   if ! is_gost_installed; then
     echo -e "${Error} gost 尚未安装，请先安装。"
-    exit 1
+    return 0
   fi
   show_all_conf
   if [[ ! -s "$raw_conf_path" ]]; then
-    exit 0
+    return 0
   fi
   count_line=$(awk 'END{print NR}' "$raw_conf_path")
   while true; do
@@ -1865,4 +1872,15 @@ case "$num" in
 *)
   echo "请输入正确数字 [1-15]"
   ;;
-esac
+  esac
+}
+
+main() {
+  update_sh
+  while true; do
+    show_main_menu
+    handle_main_menu
+  done
+}
+
+main
