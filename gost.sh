@@ -2,7 +2,7 @@
 Green_font_prefix="\033[32m" && Red_font_prefix="\033[31m" && Green_background_prefix="\033[42;37m" && Font_color_suffix="\033[0m"
 Info="${Green_font_prefix}[信息]${Font_color_suffix}"
 Error="${Red_font_prefix}[错误]${Font_color_suffix}"
-shell_version="1.1.7"
+shell_version="1.1.8"
 ct_new_ver="2.11.2" # 2.x 不再跟随官方更新
 gost_conf_path="/etc/gost/config.json"
 raw_conf_path="/etc/gost/rawconf"
@@ -10,6 +10,7 @@ install_tmp_dir=""
 peer_tmp_file=""
 release=""
 service_manager=""
+share_code_max_length=8192
 
 cleanup_temp() {
   if [[ -n "${install_tmp_dir}" && -d "${install_tmp_dir}" ]]; then
@@ -381,6 +382,22 @@ normalize_input() {
     esac
   done <<<"$input"
   printf '%s' "$output"
+}
+
+normalize_share_code() {
+  local input="$1"
+  printf '%s' "${input}" | tr -d '[:space:]'
+}
+
+validate_share_code_length() {
+  local share_code="$1"
+  local code_length=0
+  code_length=${#share_code}
+  if ((code_length > share_code_max_length)); then
+    echo -e "${Error} 分享码长度为 ${code_length}，超过上限 ${share_code_max_length}。"
+    echo -e "${Info} 单条规则请优先使用分享码；多规则或均衡负载较多时建议改用规则包导入导出。"
+    return 1
+  fi
 }
 
 ask_yes_no() {
@@ -756,9 +773,6 @@ import_rules() {
     echo -e "${Error} 导入文件不存在：${import_path}"
     return 1
   fi
-  if ! ask_yes_no "导入会覆盖当前规则，是否继续？[y/N]:" "n"; then
-    return 0
-  fi
 
   unpack_dir=$(mktemp -d /tmp/gost-import.XXXXXX) || {
     echo -e "${Error} 无法创建导入临时目录。"
@@ -780,6 +794,10 @@ import_rules() {
   if ! validate_rawconf_file "${imported_rawconf}"; then
     rm -rf "${unpack_dir}"
     return 1
+  fi
+  if ! confirm_import_preview "${imported_rawconf}" "overwrite"; then
+    rm -rf "${unpack_dir}"
+    return 0
   fi
 
   apply_import_bundle "${imported_rawconf}" "${unpack_dir}" "overwrite"
@@ -836,6 +854,10 @@ export_share_code() {
   fi
 
   share_code="MEG1:$(base64 -w0 "${share_archive}")"
+  if ! validate_share_code_length "${share_code}"; then
+    rm -rf "${export_tmp_dir}"
+    return 1
+  fi
   echo -e "${Info} 分享码如下，复制整串即可："
   echo "${share_code}"
   rm -rf "${export_tmp_dir}"
@@ -856,9 +878,12 @@ import_share_code() {
   fi
 
   prompt_nonempty "请粘贴分享码: " "" "分享码不能为空"
-  share_code="$REPLY"
+  share_code=$(normalize_share_code "$REPLY")
   if [[ "${share_code}" != MEG1:* ]]; then
     echo -e "${Error} 分享码格式不正确。"
+    return 1
+  fi
+  if ! validate_share_code_length "${share_code}"; then
     return 1
   fi
   payload="${share_code#MEG1:}"
@@ -898,6 +923,10 @@ import_share_code() {
   if ! validate_rawconf_file "${imported_rawconf}"; then
     rm -rf "${unpack_dir}"
     return 1
+  fi
+  if ! confirm_import_preview "${imported_rawconf}" "${import_mode}"; then
+    rm -rf "${unpack_dir}"
+    return 0
   fi
 
   apply_import_bundle "${imported_rawconf}" "${unpack_dir}" "${import_mode}"
@@ -1365,6 +1394,97 @@ function eachconf_retrieve() {
   s_port=${flag_s_port#*/}
   is_encrypt=${flag_s_port%/*}
 }
+function get_rule_display_name() {
+  if [ "$is_encrypt" == "nonencrypt" ]; then
+    str="不加密中转"
+  elif [ "$is_encrypt" == "encrypttls" ]; then
+    str=" tls隧道 "
+  elif [ "$is_encrypt" == "encryptws" ]; then
+    str="  ws隧道 "
+  elif [ "$is_encrypt" == "encryptwss" ]; then
+    str=" wss隧道 "
+  elif [ "$is_encrypt" == "peerno" ]; then
+    str=" 不加密均衡负载 "
+  elif [ "$is_encrypt" == "peertls" ]; then
+    str=" tls隧道均衡负载 "
+  elif [ "$is_encrypt" == "peerws" ]; then
+    str="  ws隧道均衡负载 "
+  elif [ "$is_encrypt" == "peerwss" ]; then
+    str=" wss隧道均衡负载 "
+  elif [ "$is_encrypt" == "decrypttls" ]; then
+    str=" tls解密 "
+  elif [ "$is_encrypt" == "decryptws" ]; then
+    str="  ws解密 "
+  elif [ "$is_encrypt" == "decryptwss" ]; then
+    str=" wss解密 "
+  elif [ "$is_encrypt" == "ss" ]; then
+    str="   ss   "
+  elif [ "$is_encrypt" == "socks" ]; then
+    str=" socks5 "
+  elif [ "$is_encrypt" == "http" ]; then
+    str=" http "
+  elif [ "$is_encrypt" == "cdnno" ]; then
+    str="不加密转发CDN"
+  elif [ "$is_encrypt" == "cdnws" ]; then
+    str="ws隧道转发CDN"
+  elif [ "$is_encrypt" == "cdnwss" ]; then
+    str="wss隧道转发CDN"
+  else
+    str=""
+  fi
+}
+
+show_rawconf_preview() {
+  local source_rawconf="$1"
+  local title="$2"
+  local count_line=0
+  local preview_index=0
+  if [[ ! -s "${source_rawconf}" ]]; then
+    echo -e "${Info} ${title}为空。"
+    return 0
+  fi
+  [[ -n "${title}" ]] && echo -e "${title}"
+  echo -e "--------------------------------------------------------"
+  echo -e "序号|方法\t    |本地端口\t|目的地地址:目的地端口"
+  echo -e "--------------------------------------------------------"
+  count_line=$(awk 'END{print NR}' "${source_rawconf}")
+  for ((preview_index = 1; preview_index <= count_line; preview_index++)); do
+    trans_conf=$(sed -n "${preview_index}p" "${source_rawconf}")
+    eachconf_retrieve
+    get_rule_display_name
+    echo -e " ${preview_index}  |$str  |$s_port\t|$d_ip:$d_port"
+    echo -e "--------------------------------------------------------"
+  done
+}
+
+count_rules_in_rawconf() {
+  local source_rawconf="$1"
+  if [[ ! -s "${source_rawconf}" ]]; then
+    printf '0'
+    return 0
+  fi
+  awk 'END{print NR}' "${source_rawconf}"
+}
+
+confirm_import_preview() {
+  local imported_rawconf="$1"
+  local import_mode="$2"
+  local current_count=0
+  local import_count=0
+
+  current_count=$(count_rules_in_rawconf "$raw_conf_path")
+  import_count=$(count_rules_in_rawconf "${imported_rawconf}")
+
+  echo -e "${Info} 当前规则数：${current_count}"
+  if [[ "${import_mode}" == "append" ]]; then
+    echo -e "${Info} 本次将追加 ${import_count} 条规则。"
+    show_rawconf_preview "${imported_rawconf}" "即将追加的规则："
+  else
+    echo -e "${Info} 本次将覆盖当前规则，并导入 ${import_count} 条规则。"
+    show_rawconf_preview "${imported_rawconf}" "即将覆盖生效的规则："
+  fi
+  ask_yes_no "确认继续导入？[y/N]:" "n"
+}
 function confstart() {
   echo "{
     \"Debug\": true,
@@ -1789,56 +1909,7 @@ function show_all_conf() {
     return 0
   fi
   echo -e "                      GOST 配置                        "
-  echo -e "--------------------------------------------------------"
-  echo -e "序号|方法\t    |本地端口\t|目的地地址:目的地端口"
-  echo -e "--------------------------------------------------------"
-
-  count_line=$(awk 'END{print NR}' $raw_conf_path)
-  for ((i = 1; i <= $count_line; i++)); do
-    trans_conf=$(sed -n "${i}p" $raw_conf_path)
-    eachconf_retrieve
-
-    if [ "$is_encrypt" == "nonencrypt" ]; then
-      str="不加密中转"
-    elif [ "$is_encrypt" == "encrypttls" ]; then
-      str=" tls隧道 "
-    elif [ "$is_encrypt" == "encryptws" ]; then
-      str="  ws隧道 "
-    elif [ "$is_encrypt" == "encryptwss" ]; then
-      str=" wss隧道 "
-    elif [ "$is_encrypt" == "peerno" ]; then
-      str=" 不加密均衡负载 "
-    elif [ "$is_encrypt" == "peertls" ]; then
-      str=" tls隧道均衡负载 "
-    elif [ "$is_encrypt" == "peerws" ]; then
-      str="  ws隧道均衡负载 "
-    elif [ "$is_encrypt" == "peerwss" ]; then
-      str=" wss隧道均衡负载 "
-    elif [ "$is_encrypt" == "decrypttls" ]; then
-      str=" tls解密 "
-    elif [ "$is_encrypt" == "decryptws" ]; then
-      str="  ws解密 "
-    elif [ "$is_encrypt" == "decryptwss" ]; then
-      str=" wss解密 "
-    elif [ "$is_encrypt" == "ss" ]; then
-      str="   ss   "
-    elif [ "$is_encrypt" == "socks" ]; then
-      str=" socks5 "
-    elif [ "$is_encrypt" == "http" ]; then
-      str=" http "
-    elif [ "$is_encrypt" == "cdnno" ]; then
-      str="不加密转发CDN"
-    elif [ "$is_encrypt" == "cdnws" ]; then
-      str="ws隧道转发CDN"
-    elif [ "$is_encrypt" == "cdnwss" ]; then
-      str="wss隧道转发CDN"
-    else
-      str=""
-    fi
-
-    echo -e " $i  |$str  |$s_port\t|$d_ip:$d_port"
-    echo -e "--------------------------------------------------------"
-  done
+  show_rawconf_preview "$raw_conf_path" ""
 }
 
 cron_restart() {
