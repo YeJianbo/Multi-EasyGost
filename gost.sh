@@ -593,7 +593,13 @@ EOF
 
 build_selected_rawconf() {
   local output_rawconf="$1"
+  local selection_mode="$2"
   local selected_index=""
+  local selected_expr=""
+  local selected_part=""
+  local range_start=0
+  local range_end=0
+  local selected_line=0
   local total_rules=0
 
   ensure_raw_conf_file
@@ -604,16 +610,72 @@ build_selected_rawconf() {
 
   show_all_conf
   total_rules=$(awk 'END{print NR}' "$raw_conf_path")
+  : >"${output_rawconf}"
+
+  if [[ "${selection_mode}" == "single" ]]; then
+    while true; do
+      prompt_nonempty "请输入要导出的规则编号：" validate_menu_number "请输入正确数字"
+      selected_index="$REPLY"
+      if ((10#$selected_index >= 1 && 10#$selected_index <= total_rules)); then
+        break
+      fi
+      echo "编号超出范围，请输入 1-${total_rules}"
+    done
+    sed -n "${selected_index}p" "$raw_conf_path" >"${output_rawconf}"
+    [[ -s "${output_rawconf}" ]]
+    return $?
+  fi
+
   while true; do
-    prompt_nonempty "请输入要导出的规则编号：" validate_menu_number "请输入正确数字"
-    selected_index="$REPLY"
-    if ((10#$selected_index >= 1 && 10#$selected_index <= total_rules)); then
+    prompt_nonempty "请输入要导出的规则编号，支持 1,3,5-7: " "" "请输入规则编号"
+    selected_expr="${REPLY// /}"
+    if [[ ! "${selected_expr}" =~ ^[0-9,-]+$ ]]; then
+      echo "格式不正确，请使用 1,3,5-7 这种形式。"
+      continue
+    fi
+
+    : >"${output_rawconf}"
+    declare -A selected_seen=()
+    local valid_selection=1
+    IFS=',' read -r -a selected_parts <<<"${selected_expr}"
+    for selected_part in "${selected_parts[@]}"; do
+      [[ -n "${selected_part}" ]] || { valid_selection=0; break; }
+      if [[ "${selected_part}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        range_start=$((10#${BASH_REMATCH[1]}))
+        range_end=$((10#${BASH_REMATCH[2]}))
+        if ((range_start < 1 || range_end < 1 || range_start > range_end || range_end > total_rules)); then
+          valid_selection=0
+          break
+        fi
+        for ((selected_line = range_start; selected_line <= range_end; selected_line++)); do
+          if [[ -z "${selected_seen[$selected_line]+x}" ]]; then
+            sed -n "${selected_line}p" "$raw_conf_path" >>"${output_rawconf}"
+            selected_seen[$selected_line]=1
+          fi
+        done
+      elif [[ "${selected_part}" =~ ^[0-9]+$ ]]; then
+        selected_line=$((10#${selected_part}))
+        if ((selected_line < 1 || selected_line > total_rules)); then
+          valid_selection=0
+          break
+        fi
+        if [[ -z "${selected_seen[$selected_line]+x}" ]]; then
+          sed -n "${selected_line}p" "$raw_conf_path" >>"${output_rawconf}"
+          selected_seen[$selected_line]=1
+        fi
+      else
+        valid_selection=0
+        break
+      fi
+    done
+    unset selected_seen
+
+    if ((valid_selection == 1)) && [[ -s "${output_rawconf}" ]]; then
       break
     fi
-    echo "编号超出范围，请输入 1-${total_rules}"
+    echo "编号范围无效，请输入 1-${total_rules} 范围内的编号，例如 1,3,5-7。"
   done
 
-  sed -n "${selected_index}p" "$raw_conf_path" >"${output_rawconf}"
   [[ -s "${output_rawconf}" ]]
 }
 
@@ -822,8 +884,9 @@ export_share_code() {
 
   echo -e "分享码导出类型:"
   echo -e "[1] 导出单条规则分享码"
-  echo -e "[2] 导出全部规则分享码"
-  prompt_choice "请选择: " 1 2
+  echo -e "[2] 导出多条规则分享码"
+  echo -e "[3] 导出全部规则分享码"
+  prompt_choice "请选择: " 1 2 3
   export_mode="$REPLY"
 
   export_tmp_dir=$(mktemp -d /tmp/gost-share-export.XXXXXX) || {
@@ -833,7 +896,13 @@ export_share_code() {
 
   if [[ "${export_mode}" == "1" ]]; then
     share_rawconf="${export_tmp_dir}/selected.rawconf"
-    if ! build_selected_rawconf "${share_rawconf}"; then
+    if ! build_selected_rawconf "${share_rawconf}" "single"; then
+      rm -rf "${export_tmp_dir}"
+      return 1
+    fi
+  elif [[ "${export_mode}" == "2" ]]; then
+    share_rawconf="${export_tmp_dir}/selected.rawconf"
+    if ! build_selected_rawconf "${share_rawconf}" "multi"; then
       rm -rf "${export_tmp_dir}"
       return 1
     fi
@@ -1996,8 +2065,6 @@ update_sh() {
       echo -e "${Info} 脚本已自动更新，正在重载。"
       exec bash "${script_path}"
     fi
-  else
-    echo -e "                 ${Red_font_prefix}脚本最新版本获取失败，请检查与 GitHub 的连接！${Font_color_suffix}"
   fi
 }
 
